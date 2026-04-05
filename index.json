@@ -5,9 +5,9 @@
     {
       "schema_version": "1.0.0",
       "id": "nymphs3d2",
-      "name": "Nymphs3D2",
+      "name": "Nymphs3D2 Blender 5.1 Test",
       "tagline": "Blender-first workflow for driving local or remote Nymphs3D backends",
-      "version": "1.0.1",
+      "version": "1.0.2",
       "type": "add-on",
       "maintainer": "Babyjawz <babyjaws@gmail.com>",
       "license": [
@@ -22,12 +22,9 @@
       "platforms": [
         "windows-x64"
       ],
-      "python_versions": [
-        "3.11"
-      ],
-      "archive_url": "./nymphs3d2-1.0.1.zip",
-      "archive_size": 576738,
-      "archive_hash": "sha256:61380dafcb1a877ae00f6cce5e265a7d249ed3734cc09e8954cfd573b6933162"
+      "archive_url": "./nymphs3d2-blender-5.1-test-1.0.2.zip",
+      "archive_size": 11853,
+      "archive_hash": "sha256:534d04707dceae96d381c765a5aead80d2cffdaa6d7cf16494cdee05adc2b3c2"
     }
   ]
 }
