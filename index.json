@@ -1,0 +1,33 @@
+{
+  "version": "v1",
+  "blocklist": [],
+  "data": [
+    {
+      "schema_version": "1.0.0",
+      "id": "nymphs3d2",
+      "name": "Nymphs3D2",
+      "tagline": "Blender-first workflow for driving local or remote Nymphs3D backends",
+      "version": "1.0.0",
+      "type": "add-on",
+      "maintainer": "Babyjawz <babyjaws@gmail.com>",
+      "license": [
+        "SPDX:GPL-3.0-or-later"
+      ],
+      "blender_version_min": "4.2.0",
+      "website": "https://github.com/Babyjawz/Nymphs3D-Blender-Addon",
+      "permissions": {
+        "network": "Connect to local or remote Nymphs3D API servers",
+        "files": "Import generated meshes and store local presets and config"
+      },
+      "platforms": [
+        "windows-x64"
+      ],
+      "python_versions": [
+        "3.11"
+      ],
+      "archive_url": "./nymphs3d2-1.0.0.zip",
+      "archive_size": 579758,
+      "archive_hash": "sha256:3f34b88242bc8bb06b8f708be37d48da4500a6ed4e3bd8d6401876f17e7cb110"
+    }
+  ]
+}
