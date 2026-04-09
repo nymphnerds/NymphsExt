@@ -7,7 +7,7 @@
       "id": "nymphs3d2",
       "name": "Nymphs3D2",
       "tagline": "Blender-first workflow for driving local or remote Nymphs3D backends",
-      "version": "1.1.29",
+      "version": "1.1.30",
       "type": "add-on",
       "maintainer": "Babyjawz <babyjaws@gmail.com>",
       "license": [
@@ -22,9 +22,9 @@
       "platforms": [
         "windows-x64"
       ],
-      "archive_url": "./nymphs3d2-1.1.29.zip",
-      "archive_size": 26960,
-      "archive_hash": "sha256:60d7b959c4560ad341d02559ae10d06dadd62dac359b0bedb3f42fdcaf6ba71b"
+      "archive_url": "./nymphs3d2-1.1.30.zip",
+      "archive_size": 27946,
+      "archive_hash": "sha256:3837ee8157c18587ccb68891a7f96455adeef3ac732795b79f6279eb8e2d70ad"
     }
   ]
 }
