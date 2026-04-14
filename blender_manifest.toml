@@ -1,0 +1,17 @@
+schema_version = "1.0.0"
+
+id = "nymphs3d2"
+version = "1.1.109"
+name = "Nymphs3D2"
+tagline = "Blender-first workflow for driving local or remote Nymphs3D backends"
+maintainer = "Babyjawz <babyjaws@gmail.com>"
+type = "add-on"
+website = "https://github.com/Babyjawz/Nymphs3D-Blender-Addon"
+
+blender_version_min = "4.2.0"
+platforms = ["windows-x64"]
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+network = "Connect to local or remote Nymphs3D API servers"
+files = "Import generated meshes and store local presets and config"
