@@ -1,4 +1,4 @@
-"""Live Blender addon entrypoint for Nymphs3D2."""
+"""Live Blender addon entrypoint for NymphsCore."""
 
 try:
     from .Nymphs3D2 import *  # noqa: F401,F403

@@ -5,21 +5,26 @@
     {
       "schema_version": "1.0.0",
       "id": "nymphs3d2",
-      "name": "Nymphs3D2",
-      "tagline": "Blender-first workflow for driving local or remote Nymphs3D backends",
-      "version": "1.1.109",
+      "name": "NymphsCore",
+      "tagline": "Blender client for NymphsCore image, shape, and texture backends",
+      "version": "1.1.110",
       "type": "add-on",
       "maintainer": "Babyjawz <babyjaws@gmail.com>",
       "license": [
         "SPDX:GPL-3.0-or-later"
       ],
       "blender_version_min": "4.2.0",
+      "website": "https://github.com/nymphnerds/NymphsCore",
+      "permissions": {
+        "network": "Connect to local NymphsCore services and OpenRouter image models",
+        "files": "Import generated meshes and store local presets and config"
+      },
       "platforms": [
         "windows-x64"
       ],
-      "archive_url": "./nymphs3d2-1.1.109.zip",
-      "archive_size": 54393,
-      "archive_hash": "sha256:a3d300e13cc00b3876429f6bf6107c0721d6546467327d40d82c1660a4855831"
+      "archive_url": "./nymphscore-1.1.110.zip",
+      "archive_size": 43444,
+      "archive_hash": "sha256:15ed8412c3a49edacbde3c686dac6dc0a5556e717e4d556155ee6d4cfebac7d0"
     }
   ]
 }

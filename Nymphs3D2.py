@@ -1,14 +1,14 @@
 """
-Live Blender addon implementation for Nymphs3D2.
+Live Blender addon implementation for NymphsCore.
 """
 
 bl_info = {
-    "name": "Nymphs3D2",
+    "name": "NymphsCore",
     "author": "Nymphs3D",
-    "version": (1, 1, 109),
+    "version": (1, 1, 110),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Nymphs",
-    "description": "Blender client for local or remote Nymphs3D backends",
+    "description": "Blender client for NymphsCore image, shape, and texture backends",
     "category": "3D View",
 }
 
@@ -19,7 +19,6 @@ import ntpath
 import os
 import queue
 import re
-import signal
 import shlex
 import shutil
 import subprocess
@@ -46,20 +45,13 @@ from bpy.props import (
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 EVENT_QUEUE = queue.Queue()
 PROCESS_LOCK = threading.Lock()
-PARTS_PROCESS_LOCK = threading.Lock()
 CACHE_LOCK = threading.Lock()
-PARTS_ACTIVE_PROCS = {}
-PARTS_STOP_REQUESTS = set()
 MANAGED_BACKENDS = {}
 MANAGED_BACKEND_TARGETS = {}
 TRANSIENT_CACHE = {}
 ATEXIT_REGISTERED = False
 STAGE_LINE = re.compile(r"STAGE:\s*([A-Za-z0-9_]+)")
 PROGRESS_LINE = re.compile(r"PROGRESS:\s*([A-Za-z0-9_ -]+)\s+(\d+)/(\d+)")
-PARTS_TQDM_PROGRESS_LINE = re.compile(
-    r"^(?P<label>.+?)\s+(?P<percent>\d+)%\|.*?\|\s*(?P<current>\d+)/(?P<total>\d+)"
-)
-PARTS_ELAPSED_LINE = re.compile(r"Still working\.\.\.\s*(?P<seconds>\d+)s elapsed")
 GPU_REFRESH_SECONDS = 5.0
 SERVER_POLL_SECONDS = 8.0
 SERVER_POLL_FAST_SECONDS = 2.0
@@ -70,11 +62,10 @@ ACTIVE_POLL_DIRECT_JOB_SECONDS = 1.0
 UI_REFRESH_ACTIVE_SECONDS = 1.0
 UI_REFRESH_IDLE_SECONDS = 5.0
 PRESET_CACHE_TTL_SECONDS = 1.0
-PARTS_REPO_STATUS_CACHE_TTL_SECONDS = 3.0
 WSL_DISTRO_CACHE_TTL_SECONDS = 15.0
 LOG_PREFIX_RE = re.compile(r"^\d{4}-\d{2}-\d{2}[^\|]*\|\s*[A-Z]+\s*\|\s*(?:stdout|stderr|[^|]+)\s*\|\s*")
 LOCAL_SHAPE_OUTPUT_DIRNAME = "nymphs3d2_shape_outputs"
-LOCAL_PARTS_OUTPUT_DIRNAME = "nymphs3d2_parts_sources"
+LOCAL_IMAGEGEN_OUTPUT_DIRNAME = "nymphs3d2_image_outputs"
 CACHE_MISS = object()
 
 DEFAULT_WSL_DISTRO = "NymphsCore"
@@ -82,15 +73,23 @@ DEFAULT_WSL_USER = "nymph"
 DEFAULT_REPO_2MV_PATH = "~/Hunyuan3D-2"
 DEFAULT_REPO_N2D2_PATH = "~/Z-Image"
 DEFAULT_REPO_TRELLIS_PATH = "~/TRELLIS.2"
-DEFAULT_REPO_PARTS_PATH = "~/Hunyuan3D-Part"
 DEFAULT_2MV_PYTHON_PATH = "~/Hunyuan3D-2/.venv/bin/python"
 DEFAULT_N2D2_PYTHON_PATH = "~/Z-Image/.venv-nunchaku/bin/python"
 DEFAULT_TRELLIS_PYTHON_PATH = "~/TRELLIS.2/.venv/bin/python"
-DEFAULT_PARTS_PYTHON_PATH = "~/Hunyuan3D-Part/.venv-official/bin/python"
 DEFAULT_N2D2_MODEL_ID = "Tongyi-MAI/Z-Image-Turbo"
 DEFAULT_N2D2_MODEL_VARIANT = ""
 DEFAULT_N2D2_NUNCHAKU_RANK = "32"
 DEFAULT_N2D2_MODEL_PRESET = "zimage_nunchaku_r32"
+OPENROUTER_API_ROOT = "https://openrouter.ai/api/v1"
+GEMINI_MODEL_IDS = {
+    "gemini_2_5_flash_image": "google/gemini-2.5-flash-image",
+    "gemini_3_1_flash_image_preview": "google/gemini-3.1-flash-image-preview",
+    "gemini_3_pro_image_preview": "google/gemini-3-pro-image-preview",
+}
+GEMINI_IMAGE_SIZE_MODELS = {
+    "google/gemini-3.1-flash-image-preview",
+    "google/gemini-3-pro-image-preview",
+}
 DEFAULT_IMAGEGEN_PROMPT_PRESET = "clean_asset_concept"
 DEFAULT_IMAGEGEN_PROMPT_TEXT_NAME = "Nymphs Image Prompt"
 WSL_DISTRO_ITEMS = []
@@ -129,16 +128,6 @@ IMAGEGEN_PROMPT_PRESETS = {
             "single original character concept, full body, centered, head to toe visible, clean silhouette, "
             "simple plain light background, soft even lighting, readable costume design, clear limb separation, "
             "appealing stylized proportions, no scenery, no props crossing the body, high quality game character concept art"
-        ),
-    },
-    "character_parts_breakout": {
-        "label": "Character Parts Breakout",
-        "description": "Character sheet prompt with separate clothing and weapon pieces laid out clearly",
-        "prompt": (
-            "single character equipment breakdown sheet, one full-body character wearing the full outfit, plus separate isolated "
-            "breakout views of every clothing piece, accessory, armor piece, and weapon on the same canvas, all items shown to "
-            "consistent scale, neatly arranged, non-overlapping, plain light background, soft even lighting, clean readable "
-            "silhouettes, clear material definition, concept art presentation sheet for 3D asset production, no scenery, no text"
         ),
     },
     "creature_asset": {
@@ -363,8 +352,6 @@ class ImportEvent:
     source_object_name: str = ""
     hide_source: bool = True
     update_shape_result: bool = True
-    parts_import: bool = False
-    collection_name: str = ""
 
 
 def _active_state(scene_name):
@@ -397,8 +384,6 @@ def _state_needs_periodic_ui_refresh(scene_name, state):
     if (state.task_status or "").lower() in {"processing", "queued"}:
         return True
     if (state.imagegen_task_status or "").lower() in {"processing", "queued"}:
-        return True
-    if _parts_run_is_active(state, scene_name):
         return True
     return False
 
@@ -557,8 +542,6 @@ def _emit_import(
     source_object_name="",
     hide_source=True,
     update_shape_result=True,
-    parts_import=False,
-    collection_name="",
 ):
     EVENT_QUEUE.put(
         (
@@ -569,120 +552,11 @@ def _emit_import(
                 source_object_name,
                 hide_source,
                 update_shape_result,
-                parts_import,
-                collection_name,
             ),
             None,
         )
     )
     _schedule_event_loop()
-
-
-def _set_parts_process(scene_name, proc):
-    with PARTS_PROCESS_LOCK:
-        if proc is None:
-            PARTS_ACTIVE_PROCS.pop(scene_name, None)
-        else:
-            PARTS_ACTIVE_PROCS[scene_name] = proc
-
-
-def _get_parts_process(scene_name):
-    with PARTS_PROCESS_LOCK:
-        return PARTS_ACTIVE_PROCS.get(scene_name)
-
-
-def _clear_parts_process(scene_name, proc=None):
-    with PARTS_PROCESS_LOCK:
-        current = PARTS_ACTIVE_PROCS.get(scene_name)
-        if proc is None or current is proc:
-            PARTS_ACTIVE_PROCS.pop(scene_name, None)
-
-
-def _mark_parts_stop_requested(scene_name):
-    with PARTS_PROCESS_LOCK:
-        PARTS_STOP_REQUESTS.add(scene_name)
-
-
-def _consume_parts_stop_requested(scene_name):
-    with PARTS_PROCESS_LOCK:
-        if scene_name in PARTS_STOP_REQUESTS:
-            PARTS_STOP_REQUESTS.discard(scene_name)
-            return True
-        return False
-
-
-def _clear_parts_stop_requested(scene_name):
-    with PARTS_PROCESS_LOCK:
-        PARTS_STOP_REQUESTS.discard(scene_name)
-
-
-def _parts_process_is_active(scene_name):
-    proc = _get_parts_process(scene_name)
-    if proc is None:
-        return False
-    try:
-        return proc.poll() is None
-    except Exception:
-        return False
-
-
-def _parts_run_is_active(state=None, scene_name=""):
-    resolved_scene = (scene_name or "").strip()
-    if not resolved_scene and state is not None:
-        owner = getattr(state, "id_data", None)
-        resolved_scene = getattr(owner, "name", "") or ""
-    if resolved_scene and _parts_process_is_active(resolved_scene):
-        return True
-    if state is None:
-        return False
-    return float(getattr(state, "parts_started_at", 0.0) or 0.0) > 0.0
-
-
-def _terminate_parts_process(scene_name):
-    proc = _get_parts_process(scene_name)
-    if proc is None:
-        return False
-    try:
-        if proc.poll() is not None:
-            _clear_parts_process(scene_name, proc)
-            return False
-    except Exception:
-        _clear_parts_process(scene_name, proc)
-        return False
-
-    _mark_parts_stop_requested(scene_name)
-    try:
-        if os.name == "nt":
-            subprocess.run(
-                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-        else:
-            os.killpg(proc.pid, signal.SIGKILL)
-    except Exception:
-        try:
-            proc.kill()
-        except Exception:
-            return False
-    return True
-
-
-def _encode_object_name_list(names):
-    cleaned = []
-    for name in names or []:
-        value = (name or "").strip()
-        if value and value not in cleaned:
-            cleaned.append(value)
-    return "\n".join(cleaned)
-
-
-def _decode_object_name_list(raw_value):
-    if not raw_value:
-        return []
-    return [line.strip() for line in str(raw_value).splitlines() if line.strip()]
 
 
 def _object_root(obj):
@@ -712,18 +586,6 @@ def _show_object_tree(obj):
         child.hide_set(False)
         child.hide_viewport = False
         child.hide_render = False
-
-
-def _selected_mesh_root_names(context):
-    selected_meshes = [obj for obj in getattr(context, "selected_objects", []) if getattr(obj, "type", "") == "MESH"]
-    if not selected_meshes:
-        return []
-    roots = []
-    for obj in selected_meshes:
-        root = _object_root(obj) or obj
-        if root is not None and root.name not in roots:
-            roots.append(root.name)
-    return roots
 
 
 def _emit_service_status(scene_name, service_key, **changes):
@@ -794,14 +656,14 @@ def _require_network_access(api_root):
         raise RuntimeError("Enable Blender online access before using a remote API URL.")
 
 
-def _http_call(method, url, payload=None, timeout=10):
+def _http_call(method, url, payload=None, timeout=10, headers=None):
     body = None
-    headers = {}
+    request_headers = dict(headers or {})
     if payload is not None:
         body = json.dumps(payload).encode("utf-8")
-        headers["Content-Type"] = "application/json"
+        request_headers.setdefault("Content-Type", "application/json")
 
-    request = Request(url=url, data=body, headers=headers, method=method)
+    request = Request(url=url, data=body, headers=request_headers, method=method)
     try:
         with urlopen(request, timeout=timeout) as response:
             return response.status, response.headers.get("Content-Type", ""), response.read()
@@ -1477,6 +1339,12 @@ def _shape_output_dir():
     return path
 
 
+def _imagegen_output_dir():
+    path = os.path.join(tempfile.gettempdir(), LOCAL_IMAGEGEN_OUTPUT_DIRNAME)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
 def _shape_output_path(source_object_name=""):
     stamp = time.strftime("%Y%m%d-%H%M%S")
     stem = _sanitize_name_fragment(source_object_name, fallback="shape")
@@ -1486,35 +1354,14 @@ def _shape_output_path(source_object_name=""):
     return os.path.join(_shape_output_dir(), f"{stamp}-{stem}-{int(time.time() * 1000) % 100000}.glb")
 
 
-def _parts_output_dir():
-    path = os.path.join(tempfile.gettempdir(), LOCAL_PARTS_OUTPUT_DIRNAME)
-    os.makedirs(path, exist_ok=True)
-    return path
-
-
-def _parts_output_path(source_name="", export_format="glb"):
+def _imagegen_output_path(provider="image", suffix=".png"):
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    stem = _sanitize_name_fragment(source_name, fallback="parts-source")
-    suffix = f".{(export_format or 'glb').strip().lower()}"
-    candidate = os.path.join(_parts_output_dir(), f"{stamp}-{stem}{suffix}")
+    stem = _sanitize_name_fragment(provider, fallback="image")
+    suffix = suffix if str(suffix or "").startswith(".") else f".{suffix or 'png'}"
+    candidate = os.path.join(_imagegen_output_dir(), f"{stamp}-{stem}{suffix}")
     if not os.path.exists(candidate):
         return candidate
-    return os.path.join(_parts_output_dir(), f"{stamp}-{stem}-{int(time.time() * 1000) % 100000}{suffix}")
-
-
-def _parts_result_root_wsl(state=None):
-    return _resolved_user_path("~/.cache/hunyuan3d-part/outputs", state)
-
-
-def _parts_result_dir_wsl(state=None, source_name="", backend_label="parts"):
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    stem = _sanitize_name_fragment(source_name, fallback="parts")
-    backend = _sanitize_name_fragment(backend_label, fallback="parts")
-    return f"{_parts_result_root_wsl(state)}/{stamp}-{backend}-{stem}"
-
-
-def _parts_result_root_host(state=None):
-    return _to_blender_accessible_path(state, _parts_result_root_wsl(state))
+    return os.path.join(_imagegen_output_dir(), f"{stamp}-{stem}-{int(time.time() * 1000) % 100000}{suffix}")
 
 
 def _clear_folder_contents(folder_path):
@@ -1539,61 +1386,6 @@ def _path_is_within(root_path, raw_path):
         return os.path.commonpath([root, candidate]) == root
     except Exception:
         return False
-
-
-def _parts_preserved_run_dirs(state=None, extra_preserve=None):
-    preserved = set()
-    if extra_preserve:
-        for raw_path in extra_preserve:
-            path = (raw_path or "").strip()
-            if not path:
-                continue
-            if os.path.isdir(path):
-                preserved.add(os.path.abspath(path))
-            else:
-                preserved.add(os.path.abspath(os.path.dirname(path)))
-    if state is None:
-        return preserved
-    for attr_name in (
-        "parts_output_dir",
-        "parts_output_path",
-        "parts_stage1_manifest_path",
-        "parts_stage1_summary_path",
-    ):
-        path = (getattr(state, attr_name, "") or "").strip()
-        if not path:
-            continue
-        if os.path.isdir(path):
-            preserved.add(os.path.abspath(path))
-        else:
-            preserved.add(os.path.abspath(os.path.dirname(path)))
-    return preserved
-
-
-def _prune_parts_result_dirs(state=None, keep_recent=0, extra_preserve=None):
-    root_path = _parts_result_root_host(state)
-    if not root_path or not os.path.isdir(root_path):
-        return 0
-    keep_recent = max(0, int(keep_recent or 0))
-    preserved = _parts_preserved_run_dirs(state, extra_preserve=extra_preserve)
-    removed = 0
-    retained_recent = 0
-    candidates = [
-        entry.path
-        for entry in os.scandir(root_path)
-        if entry.is_dir(follow_symlinks=False)
-    ]
-    candidates.sort(key=lambda path: os.path.getmtime(path), reverse=True)
-    for path in candidates:
-        normalized = os.path.abspath(path)
-        if normalized in preserved:
-            continue
-        if retained_recent < keep_recent:
-            retained_recent += 1
-            continue
-        shutil.rmtree(path)
-        removed += 1
-    return removed
 
 
 def _to_blender_accessible_path(state, raw_path):
@@ -1676,6 +1468,166 @@ def _build_mv_prompt(state, view_phrase):
         view_phrase,
     ]
     return ", ".join(part for part in prompt_parts if part)
+
+
+def _gemini_model_id(state_or_snapshot):
+    raw_value = ""
+    if isinstance(state_or_snapshot, dict):
+        raw_value = (state_or_snapshot.get("gemini_model") or "").strip()
+    else:
+        raw_value = (getattr(state_or_snapshot, "gemini_model", "") or "").strip()
+    return GEMINI_MODEL_IDS.get(raw_value, raw_value or GEMINI_MODEL_IDS["gemini_2_5_flash_image"])
+
+
+def _gemini_model_label(model_id):
+    if model_id == "google/gemini-3.1-flash-image-preview":
+        return "Gemini 3.1 Flash Image"
+    if model_id == "google/gemini-3-pro-image-preview":
+        return "Gemini 3 Pro Image"
+    return "Gemini 2.5 Flash Image"
+
+
+def _gemini_api_key(state):
+    key = (getattr(state, "openrouter_api_key", "") or "").strip()
+    if key:
+        return key
+    key = (os.environ.get("OPENROUTER_API_KEY") or "").strip()
+    if key:
+        return key
+    raise RuntimeError("Enter an OpenRouter API key or set OPENROUTER_API_KEY before using Gemini image generation.")
+
+
+def _gemini_snapshot(state):
+    model_id = _gemini_model_id(state)
+    snapshot = {
+        "api_key": _gemini_api_key(state),
+        "model_id": model_id,
+        "model_label": _gemini_model_label(model_id),
+        "aspect_ratio": (getattr(state, "gemini_aspect_ratio", "1:1") or "1:1").strip(),
+        "image_size": (getattr(state, "gemini_image_size", "1K") or "1K").strip(),
+    }
+    if model_id not in GEMINI_IMAGE_SIZE_MODELS:
+        snapshot["image_size"] = ""
+    return snapshot
+
+
+def _gemini_image_suffix(mime_type):
+    value = (mime_type or "").lower()
+    if "jpeg" in value or "jpg" in value:
+        return ".jpg"
+    if "webp" in value:
+        return ".webp"
+    return ".png"
+
+
+def _gemini_safe_response_for_metadata(detail):
+    safe_detail = json.loads(json.dumps(detail))
+    for choice in safe_detail.get("choices", []) or []:
+        message = choice.get("message") or {}
+        for image in message.get("images", []) or []:
+            image_url = image.get("image_url") or image.get("imageUrl") or {}
+            if isinstance(image_url, dict) and image_url.get("url"):
+                image_url["url"] = "<omitted>"
+    return safe_detail
+
+
+def _decode_image_data_url(data_url):
+    value = (data_url or "").strip()
+    if not value:
+        raise RuntimeError("OpenRouter returned an empty image URL.")
+    mime_type = "image/png"
+    encoded = value
+    if value.startswith("data:"):
+        header, separator, encoded = value.partition(",")
+        if not separator:
+            raise RuntimeError("OpenRouter returned a malformed image data URL.")
+        mime_type = header[5:].split(";", 1)[0] or mime_type
+    try:
+        return mime_type, base64.b64decode(encoded)
+    except Exception as exc:
+        raise RuntimeError("OpenRouter returned image data that could not be decoded.") from exc
+
+
+def _gemini_request_image(snapshot, prompt, output_label):
+    prompt = (prompt or "").strip()
+    if not prompt:
+        raise RuntimeError("Enter an image-generation prompt first.")
+
+    model_id = snapshot["model_id"]
+    image_config = {
+        "aspect_ratio": snapshot.get("aspect_ratio") or "1:1",
+    }
+    if model_id in GEMINI_IMAGE_SIZE_MODELS and snapshot.get("image_size"):
+        image_config["image_size"] = snapshot["image_size"]
+
+    payload = {
+        "model": model_id,
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ],
+        "modalities": ["image", "text"],
+        "stream": False,
+        "image_config": image_config,
+    }
+    headers = {
+        "Authorization": f"Bearer {snapshot['api_key']}",
+    }
+    _, _, body = _http_call(
+        "POST",
+        f"{OPENROUTER_API_ROOT}/chat/completions",
+        payload=payload,
+        headers=headers,
+        timeout=1800,
+    )
+    try:
+        detail = json.loads(body.decode("utf-8"))
+    except Exception as exc:
+        raise RuntimeError("Gemini returned invalid JSON.") from exc
+
+    text_parts = []
+    image_urls = []
+    for choice in detail.get("choices", []) or []:
+        message = choice.get("message") or {}
+        if message.get("content"):
+            text_parts.append(str(message["content"]).strip())
+        for image in message.get("images", []) or []:
+            image_url = image.get("image_url") or image.get("imageUrl") or {}
+            if isinstance(image_url, dict) and image_url.get("url"):
+                image_urls.append(image_url["url"])
+
+    if not image_urls:
+        reason = (detail.get("error") or {}).get("message", "")
+        message = "Gemini did not return an image."
+        if reason:
+            message += f" {reason}"
+        if text_parts:
+            message += f" Response: {' '.join(text_parts)[:500]}"
+        raise RuntimeError(message)
+
+    mime_type, image_bytes = _decode_image_data_url(image_urls[0])
+
+    output_path = _imagegen_output_path(output_label, _gemini_image_suffix(mime_type))
+    with open(output_path, "wb") as handle:
+        handle.write(image_bytes)
+
+    metadata = {
+        "provider": "gemini",
+        "model": model_id,
+        "prompt": prompt,
+        "aspect_ratio": snapshot.get("aspect_ratio") or "1:1",
+        "image_size": snapshot.get("image_size") or "",
+        "mime_type": mime_type,
+        "text": [part for part in text_parts if part],
+        "response": _gemini_safe_response_for_metadata(detail),
+    }
+    metadata_path = os.path.splitext(output_path)[0] + ".json"
+    with open(metadata_path, "w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, indent=2)
+
+    return output_path, metadata_path
 
 
 def _export_selected_mesh_file(context, export_format="glb", destination_path=""):
@@ -2145,396 +2097,6 @@ def _path_leaf(raw_path):
     return cleaned.replace("\\", "/").rsplit("/", 1)[-1]
 
 
-def _parts_source_summary(context, state):
-    source_mode = (getattr(state, "parts_source_mode", "SELECTED") or "SELECTED").upper()
-    if source_mode == "LATEST":
-        latest_path = (getattr(state, "shape_output_path", "") or "").strip()
-        if latest_path:
-            return True, f"Latest Result: {_path_leaf(latest_path)}"
-        selected_meshes = [obj for obj in getattr(context, "selected_objects", []) if getattr(obj, "type", "") == "MESH"]
-        if selected_meshes:
-            active_object = getattr(context, "active_object", None)
-            source_object = active_object if active_object in selected_meshes else selected_meshes[0]
-            return True, f"Latest Result unavailable. Fallback: {source_object.name}"
-        return False, "No latest generated mesh is available yet."
-
-    selected_meshes = [obj for obj in getattr(context, "selected_objects", []) if getattr(obj, "type", "") == "MESH"]
-    if not selected_meshes:
-        return False, "Select a mesh object first."
-    active_object = getattr(context, "active_object", None)
-    source_object = active_object if active_object in selected_meshes else selected_meshes[0]
-    return True, f"Selected Mesh: {source_object.name}"
-
-
-def _parts_repo_status(state):
-    repo_path = _resolved_user_path(
-        getattr(state, "parts_repo_path", DEFAULT_REPO_PARTS_PATH).strip() or DEFAULT_REPO_PARTS_PATH,
-        state,
-    )
-    python_path = _resolved_user_path(
-        getattr(state, "parts_python_path", DEFAULT_PARTS_PYTHON_PATH).strip() or DEFAULT_PARTS_PYTHON_PATH,
-        state,
-    )
-    cache_key = (
-        _resolved_wsl_distro_name(state),
-        _resolved_wsl_user_name(state),
-        repo_path,
-        python_path,
-    )
-
-    def _load():
-        repo_status_path = _to_blender_accessible_path(state, repo_path)
-        python_status_path = _to_blender_accessible_path(state, python_path)
-        repo_exists = _blender_path_is_dir(state, repo_status_path)
-        python_exists = _blender_path_exists(state, python_status_path)
-        p3_sam_exists = repo_exists and _blender_path_is_dir(
-            state, _to_blender_accessible_path(state, os.path.join(repo_path, "P3-SAM"))
-        )
-        xpart_exists = repo_exists and _blender_path_is_dir(
-            state, _to_blender_accessible_path(state, os.path.join(repo_path, "XPart"))
-        )
-        p3_sam_demo = p3_sam_exists and _blender_path_is_file(
-            state, _to_blender_accessible_path(state, os.path.join(repo_path, "P3-SAM", "demo", "auto_mask.py"))
-        )
-        xpart_demo = xpart_exists and _blender_path_is_file(
-            state, _to_blender_accessible_path(state, os.path.join(repo_path, "XPart", "demo.py"))
-        )
-        xpart_weights_note = xpart_exists and _blender_path_is_file(
-            state, _to_blender_accessible_path(state, os.path.join(repo_path, "XPart", "README.md"))
-        )
-
-        if not repo_exists:
-            summary = "Repo not found."
-        elif p3_sam_demo and xpart_demo:
-            summary = "P3-SAM ready to prototype. X-Part is research-only for now."
-        elif p3_sam_demo:
-            summary = "P3-SAM ready to prototype."
-        elif xpart_demo:
-            summary = "X-Part code found, but public release still looks incomplete."
-        else:
-            summary = "Repo found, but no usable public demo entrypoints were detected."
-
-        return {
-            "repo_path": repo_path,
-            "python_path": python_path,
-            "repo_exists": repo_exists,
-            "python_exists": python_exists,
-            "p3_sam_exists": p3_sam_exists,
-            "xpart_exists": xpart_exists,
-            "p3_sam_demo": p3_sam_demo,
-            "xpart_demo": xpart_demo,
-            "xpart_weights_note": xpart_weights_note,
-            "summary": summary,
-        }
-
-    return _transient_cached("parts_repo_status", cache_key, PARTS_REPO_STATUS_CACHE_TTL_SECONDS, _load)
-
-
-def _parts_backend_label(backend_choice):
-    choice = (backend_choice or "P3SAM").upper()
-    if choice == "XPART":
-        return "X-Part"
-    return "P3-SAM"
-
-
-def _parts_compose_status_text(stage="", detail="", progress=""):
-    stage = (stage or "").strip()
-    detail = (detail or "").strip()
-    progress = (progress or "").strip()
-    if stage and progress:
-        return f"{stage} | {progress}"
-    if stage and detail:
-        return f"{stage}: {detail}"
-    return stage or detail or progress
-
-
-def _parts_tqdm_progress(line):
-    cleaned = (line or "").replace("\r", "").strip()
-    match = PARTS_TQDM_PROGRESS_LINE.search(cleaned)
-    if not match:
-        return None
-    label = match.group("label").strip().rstrip(":").strip()
-    percent = match.group("percent").strip()
-    current = match.group("current").strip()
-    total = match.group("total").strip()
-    return {
-        "label": label,
-        "progress": f"{current}/{total} ({percent}%)",
-    }
-
-
-def _parts_progress_update(line, backend_choice, current_stage="", current_detail="", current_progress=""):
-    cleaned = (line or "").replace("\r", "").strip()
-    if not cleaned:
-        return None
-    if cleaned.startswith("__NYMPHS_PARTS_PID__ "):
-        return None
-    stage = (current_stage or "").strip()
-    detail = (current_detail or "").strip()
-    progress = (current_progress or "").strip()
-    backend_label = _parts_backend_label(backend_choice)
-    lowered = cleaned.lower()
-
-    def _result(stage_value=None, detail_value=None, progress_value=None):
-        next_stage = (stage_value if stage_value is not None else stage).strip()
-        next_detail = (detail_value if detail_value is not None else detail).strip()
-        next_progress = (progress_value if progress_value is not None else progress).strip()
-        status_text = _parts_compose_status_text(next_stage, next_detail, next_progress)[:160]
-        changes = {
-            "parts_status_text": status_text,
-            "status_text": status_text,
-            "parts_status_stage": next_stage,
-            "parts_status_detail": next_detail,
-            "parts_status_progress": next_progress,
-        }
-        if stage_value == "" and not next_stage:
-            changes["parts_status_stage"] = ""
-        if detail_value == "" and not next_detail:
-            changes["parts_status_detail"] = ""
-        if progress_value == "" and not next_progress:
-            changes["parts_status_progress"] = ""
-        return changes
-
-    if cleaned.startswith("[X-Part] "):
-        text = cleaned.replace("[X-Part] ", "", 1).strip()
-        elapsed_match = PARTS_ELAPSED_LINE.search(text)
-        if elapsed_match:
-            return _result(progress_value=f"Elapsed {elapsed_match.group('seconds')}s")
-        if text.startswith("Resolving Stage-1 analysis inputs"):
-            return _result(stage_value="Resolve Inputs", detail_value=text, progress_value="")
-        if text.startswith("Loading X-Part model"):
-            return _result(stage_value="Load Model", detail_value=text, progress_value="")
-        if text.startswith("Moving X-Part model to target device"):
-            return _result(stage_value="Model Transfer", detail_value=text, progress_value="")
-        if text.startswith("Model loaded. Starting X-Part pipeline"):
-            return _result(stage_value="Prepare Generation", detail_value=text, progress_value="")
-        if text.startswith("X-Part settings:"):
-            return _result(detail_value=text)
-        if text.startswith("CUDA ready on"):
-            return _result(detail_value=text)
-        if text.startswith("Preparing latent allocation and conditioner inputs"):
-            return _result(stage_value="Prepare Generation", detail_value=text, progress_value="")
-        if text.startswith("Encoding part and object conditions"):
-            return _result(stage_value="Conditioning", detail_value=text, progress_value="")
-        if text.startswith("Conditioning complete. Starting diffusion sampling"):
-            return _result(stage_value="Diffusion Sampling", detail_value=text, progress_value="")
-        if text.startswith("Diffusion complete. Starting mesh extraction"):
-            return _result(stage_value="Export Geometry", detail_value=text, progress_value="")
-        if text.startswith("Pipeline returned. Exporting part meshes"):
-            return _result(stage_value="Finalize Export", detail_value=text, progress_value="")
-        if text.startswith("Export complete"):
-            return _result(stage_value="Completed", detail_value=text, progress_value="")
-        return _result(detail_value=text)
-    if cleaned.startswith("Diffusion Sampling::"):
-        progress_info = _parts_tqdm_progress(cleaned)
-        if progress_info:
-            return _result(
-                stage_value="Diffusion Sampling",
-                detail_value="Sampling part latents on CUDA",
-                progress_value=progress_info["progress"],
-            )
-        return _result(stage_value="Diffusion Sampling", detail_value=cleaned[:140])
-    if cleaned.startswith("MC Level ") and "Implicit Function" in cleaned:
-        progress_info = _parts_tqdm_progress(cleaned)
-        if progress_info:
-            return _result(
-                stage_value="Export Geometry",
-                detail_value=progress_info["label"][:140],
-                progress_value=progress_info["progress"],
-            )
-        return _result(stage_value="Export Geometry", detail_value=cleaned[:140])
-    if cleaned.startswith("[X-PartDiag] "):
-        if cleaned.startswith("[X-PartDiag] startup "):
-            return _result(stage_value="Startup Checks", detail_value="Verifying Python, torch, and CUDA runtime", progress_value="")
-        if cleaned.startswith("[X-PartDiag] pre-model-transfer "):
-            return _result(stage_value="Pre-Transfer Checks", detail_value="Verifying CUDA before model transfer", progress_value="")
-        if cleaned.startswith("[X-PartDiag] pre-generation "):
-            return _result(stage_value="Pre-Generation Checks", detail_value="Verifying CUDA before generation", progress_value="")
-        return _result(detail_value=cleaned[:140])
-    if cleaned.startswith("[X-PartExportDiag] "):
-        phase_match = re.search(r"phase=([a-z0-9\-]+)", cleaned)
-        phase = phase_match.group(1) if phase_match else ""
-        phase_map = {
-            "export-stage-start": ("Prepare Export", "Preparing export stage"),
-            "export-stage-after-offload": ("Prepare Export", "Offloaded model and conditioner to CPU"),
-            "export-stage-after-vae-to-device": ("Prepare Export", "Moved VAE to CUDA"),
-            "export-before-vae-decode": ("Prepare Export", "Decoding VAE latents"),
-            "export-after-vae-decode": ("Export Geometry", "Decoded VAE latents"),
-            "export-after-latent2mesh": ("Export Geometry", "Converted latent field to mesh"),
-            "export-exception": ("Export Failed", "Export failed during latent-to-mesh"),
-        }
-        stage_value, detail_value = phase_map.get(phase, (current_stage or "Export", cleaned[:140]))
-        return _result(stage_value=stage_value, detail_value=detail_value)
-    if cleaned.startswith(">>>>>>"):
-        cleaned = cleaned.replace(">>>>>>", "", 1).strip()
-        cleaned = cleaned.replace("代码", "", 1).strip()
-        stage_value = "Analyze Mesh" if backend_label == "P3-SAM" else current_stage
-        return _result(stage_value=stage_value, detail_value=cleaned[:140])
-    if cleaned.startswith("{") and '"part_count"' in cleaned:
-        return _result(stage_value="Completed", detail_value="Parts export finished.", progress_value="")
-    if cleaned.startswith("{") and '"parts_output_path"' in cleaned:
-        return _result(stage_value="Completed", detail_value="Part generation finished.", progress_value="")
-    if "CUDA preflight failed" in cleaned:
-        return _result(stage_value="Failed", detail_value="CUDA preflight failed. Restart WSL or reboot Windows before retrying X-Part.", progress_value="")
-    if "CUDA device became unavailable during" in cleaned:
-        return _result(stage_value="Failed", detail_value="CUDA device became unavailable during X-Part model transfer.", progress_value="")
-    if "CUDA runtime failed during" in cleaned:
-        return _result(stage_value="Failed", detail_value="CUDA runtime failed during X-Part.", progress_value="")
-    if "CUDA driver error: device not ready" in cleaned:
-        return _result(stage_value="Failed", detail_value="CUDA device not ready. Restart WSL or reboot Windows before retrying X-Part.", progress_value="")
-    if "Found no NVIDIA driver on your system" in cleaned:
-        return _result(stage_value="Failed", detail_value="No NVIDIA driver is visible inside WSL. Restart WSL or reboot Windows.", progress_value="")
-    if "Loading checkpoint from HuggingFace" in cleaned:
-        return _result(stage_value="Load Model", detail_value="Loading Sonata checkpoint...", progress_value="")
-    if "trying to download model from huggingface" in cleaned:
-        return _result(stage_value="Analyze Mesh", detail_value="Loading P3-SAM weights...", progress_value="")
-    if cleaned.startswith("flash attention:"):
-        return _result(detail_value=cleaned[:120])
-    if "点数：" in cleaned or "面片数：" in cleaned:
-        stage_value = "Analyze Mesh" if backend_label == "P3-SAM" else current_stage
-        return _result(stage_value=stage_value, detail_value=cleaned[:140])
-    if "生成face_ids完成" in cleaned:
-        return _result(stage_value="Analyze Mesh", detail_value="Projected part labels onto mesh.", progress_value="")
-    if "最终mask数量" in cleaned:
-        return _result(stage_value="Analyze Mesh", detail_value=cleaned[:140], progress_value="")
-    return None
-
-
-def _prepare_parts_source(context, state):
-    source_mode = (getattr(state, "parts_source_mode", "SELECTED") or "SELECTED").upper()
-    export_format = (getattr(state, "parts_export_format", "glb") or "glb").strip().lower()
-
-    if source_mode == "LATEST":
-        latest_path = (getattr(state, "shape_output_path", "") or "").strip()
-        if not latest_path:
-            raise RuntimeError("No latest generated mesh is available yet.")
-        resolved = bpy.path.abspath(latest_path)
-        if not os.path.exists(resolved):
-            raise RuntimeError(f"Latest generated mesh is missing: {latest_path}")
-        source_name = _path_leaf(resolved) or "latest-result"
-        destination_path = _parts_output_path(source_name, export_format="glb")
-        shutil.copy2(resolved, destination_path)
-        latest_object_name = (getattr(state, "latest_result_object_name", "") or "").strip()
-        source_object_names = _decode_object_name_list(latest_object_name)
-        source_object_names = [name for name in source_object_names if bpy.data.objects.get(name) is not None]
-        if not source_object_names:
-            source_object_names = _selected_mesh_root_names(context)
-        return destination_path, f"Latest Result: {_path_leaf(destination_path)}", _encode_object_name_list(source_object_names)
-
-    destination_path = _parts_output_path("selected-mesh", export_format=export_format)
-    export_path, source_name = _export_selected_mesh_file(
-        context,
-        export_format=export_format,
-        destination_path=destination_path,
-    )
-    return export_path, f"Selected Mesh: {source_name}", source_name
-
-
-def _parts_input_shell_path(raw_path):
-    path = os.path.abspath((raw_path or "").strip())
-    if os.name == "nt":
-        drive, tail = ntpath.splitdrive(path)
-        if drive and len(drive) == 2 and drive[1] == ":":
-            drive_letter = drive[0].lower()
-            wsl_tail = tail.replace("\\", "/")
-            return shlex.quote(f"/mnt/{drive_letter}{wsl_tail}")
-        return f'$(wslpath -a {shlex.quote(path)})'
-    return shlex.quote(path)
-
-
-def _parts_snapshot_get(state, attr_name, default=None):
-    if isinstance(state, dict):
-        return state.get(attr_name, default)
-    return getattr(state, attr_name, default)
-
-
-def _parts_run_shell(state, prepared_path, output_dir, backend_choice):
-    raw_repo_path = (_parts_snapshot_get(state, "parts_repo_path", DEFAULT_REPO_PARTS_PATH) or DEFAULT_REPO_PARTS_PATH).strip()
-    raw_python_path = (_parts_snapshot_get(state, "parts_python_path", DEFAULT_PARTS_PYTHON_PATH) or DEFAULT_PARTS_PYTHON_PATH).strip()
-    repo_path = _resolved_user_path(raw_repo_path or DEFAULT_REPO_PARTS_PATH, state)
-    python_path = _resolved_user_path(raw_python_path or DEFAULT_PARTS_PYTHON_PATH, state)
-    backend_label = _parts_backend_label(backend_choice)
-    output_dir_q = shlex.quote(output_dir)
-    exports = (
-        "export CUDA_HOME=/usr/local/cuda-12.4; "
-        'export PATH="$CUDA_HOME/bin:$PATH"; '
-        'export LD_LIBRARY_PATH="$CUDA_HOME/lib64:$LD_LIBRARY_PATH"; '
-        'export TORCH_CUDA_ARCH_LIST="8.9"; '
-        'export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"; '
-        f'export NYMPHS3D_PARTS_CACHE_ROOT={shlex.quote(_resolved_user_path("~/.cache/hunyuan3d-part", state))}; '
-    )
-    if backend_choice == "XPART":
-        manifest_path = (_parts_snapshot_get(state, "parts_stage1_manifest_path", "") or "").strip()
-        if not manifest_path:
-            return None, "Run Analyze Mesh first so X-Part has a Stage-1 manifest to consume."
-        manifest_expr = _parts_input_shell_path(manifest_path)
-        cpu_threads = max(1, int(_parts_snapshot_get(state, "parts_xpart_cpu_threads", 4)))
-        parts = [
-            python_path,
-            "-u",
-            "scripts/run_xpart_generate.py",
-            "--stage1_manifest",
-            manifest_expr,
-            "--output_dir",
-            output_dir_q,
-            "--num_inference_steps",
-            shlex.quote(str(max(1, int(_parts_snapshot_get(state, "parts_xpart_steps", 50))))),
-            "--octree_resolution",
-            shlex.quote(str(max(256, int(_parts_snapshot_get(state, "parts_xpart_octree_resolution", 512))))),
-            "--dtype",
-            shlex.quote(str((_parts_snapshot_get(state, "parts_xpart_dtype", "float32") or "float32"))),
-            "--max_aabb",
-            shlex.quote(str(max(0, int(_parts_snapshot_get(state, "parts_xpart_max_aabb", 0))))),
-            "--cpu_threads",
-            shlex.quote(str(cpu_threads)),
-            "--progress_interval",
-            "10",
-        ]
-        cmd = " ".join(parts)
-        shell = (
-            f"{exports}"
-            f"export OMP_NUM_THREADS={cpu_threads}; "
-            f"export OPENBLAS_NUM_THREADS={cpu_threads}; "
-            f"export MKL_NUM_THREADS={cpu_threads}; "
-            f"export NUMEXPR_NUM_THREADS={cpu_threads}; "
-            f"export VECLIB_MAXIMUM_THREADS={cpu_threads}; "
-            f"export BLIS_NUM_THREADS={cpu_threads}; "
-            f"mkdir -p {output_dir_q}; "
-            f"cd {_shell_repo_path(repo_path)}; "
-            "printf '__NYMPHS_PARTS_PID__ %s\\n' $$; "
-            f"exec nice -n 10 {cmd}"
-        )
-        return shell, ""
-
-    mesh_expr = _parts_input_shell_path(prepared_path)
-    parts = [
-        python_path,
-        "-u",
-        "scripts/run_p3sam_segment.py",
-        "--mesh_path",
-        mesh_expr,
-        "--output_dir",
-        output_dir_q,
-        "--point_num",
-        shlex.quote(str(max(1000, int(_parts_snapshot_get(state, "parts_point_num", 30000))))),
-        "--prompt_num",
-        shlex.quote(str(max(8, int(_parts_snapshot_get(state, "parts_prompt_num", 96))))),
-        "--prompt_bs",
-        shlex.quote(str(max(1, int(_parts_snapshot_get(state, "parts_prompt_bs", 4))))),
-        "--parallel",
-        "0",
-    ]
-    cmd = " ".join(parts)
-    shell = (
-        f"{exports}"
-        f"mkdir -p {output_dir_q}; "
-        f"cd {_shell_repo_path(repo_path)}; "
-        "printf '__NYMPHS_PARTS_PID__ %s\\n' $$; "
-        f"exec {cmd}"
-    )
-    return shell, ""
-
-
 def _format_elapsed_time(started_at):
     try:
         started = float(started_at or 0.0)
@@ -2656,27 +2218,6 @@ def _imagegen_progress_lines(state):
     return stage or "Generating Image", detail, progress
 
 
-def _parts_progress_lines(state):
-    if not _parts_run_is_active(state):
-        return "", "", ""
-    stage = (getattr(state, "parts_status_stage", "") or "").strip()
-    detail = (getattr(state, "parts_status_detail", "") or "").strip()
-    progress = (getattr(state, "parts_status_progress", "") or "").strip()
-    if not stage and not detail and not progress:
-        detail = (state.parts_status_text or "").strip()
-    if not stage and detail:
-        lowered = detail.lower()
-        if "x-part" in lowered:
-            stage = "Running X-Part"
-        elif "p3-sam" in lowered:
-            stage = "Running P3-SAM"
-        else:
-            stage = "Running Parts"
-    if not detail and not progress:
-        return "", "", ""
-    return stage, detail, progress
-
-
 def _primary_3d_runtime_is_active(state):
     service_key = _selected_3d_service_key(state)
     launch_state = _service_get(state, service_key, "launch_state", "Stopped")
@@ -2697,10 +2238,6 @@ def _server_panel_job_lines(state):
         )
     if state.launch_state == "Stopping":
         return ("Stopping", state.launch_detail or "Stopping backend...", "")
-    if _parts_run_is_active(state):
-        parts_lines = _parts_progress_lines(state)
-        if any(parts_lines):
-            return parts_lines
     if state.waiting_for_backend_progress:
         return "Request Sent", "Waiting for backend progress...", ""
     lines = _progress_lines(state)
@@ -2760,8 +2297,6 @@ def _server_status_line(state):
         return f"{backend_label} Busy"
     if active_status == "queued" or state.waiting_for_backend_progress:
         return f"{backend_label} Submitting"
-    if _parts_run_is_active(state):
-        return "Nymphs Parts Busy"
     if image_status == "processing":
         return f"{SERVICE_LABELS['n2d2']} Busy"
     if image_status == "queued" or state.imagegen_is_busy:
@@ -3034,12 +2569,6 @@ def _shutdown_managed_backends():
         stop_port = (target or {}).get("port") or "8080"
         _best_effort_stop_local(stop_port, target, service_key=service_key)
 
-    for scene_name in list(PARTS_ACTIVE_PROCS.keys()):
-        try:
-            _terminate_parts_process(scene_name)
-        except Exception:
-            pass
-
 
 def _sync_local_api(state):
     state.api_root = _service_api_root(state, _selected_3d_service_key(state))
@@ -3211,107 +2740,6 @@ def _compose_wsl_invocation(shell, state=None):
         command.extend(["-u", user_name])
     command.extend(["--", "bash", "-lc", shell])
     return command
-
-
-def _parts_internal_pid_from_line(line):
-    cleaned = (line or "").replace("\r", "").strip()
-    prefix = "__NYMPHS_PARTS_PID__ "
-    if not cleaned.startswith(prefix):
-        return 0
-    try:
-        return max(0, int(cleaned[len(prefix):].strip()))
-    except Exception:
-        return 0
-
-
-def _format_kib_for_status(raw_value):
-    try:
-        kib = float(raw_value or 0.0)
-    except Exception:
-        return ""
-    if kib <= 0:
-        return ""
-    if kib >= 1024:
-        return f"{kib / 1024.0:.0f} MiB"
-    return f"{int(kib)} KiB"
-
-
-def _parts_process_stats(scene_name, state=None):
-    proc = _get_parts_process(scene_name)
-    if proc is None:
-        return {}
-    try:
-        if proc.poll() is not None:
-            return {}
-    except Exception:
-        return {}
-
-    if os.name == "nt":
-        wsl_pid = max(0, int(getattr(state, "parts_wsl_pid", 0) or 0))
-        if wsl_pid <= 0:
-            return {}
-        command = _compose_wsl_invocation(
-            f"ps -p {wsl_pid} -o %cpu=,%mem=,rss=,etime=",
-            state,
-        )
-    else:
-        pid = max(0, int(getattr(state, "parts_wsl_pid", 0) or 0)) or int(proc.pid)
-        command = ["ps", "-p", str(pid), "-o", "%cpu=,%mem=,rss=,etime="]
-
-    try:
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=1.0,
-            check=False,
-        )
-    except Exception:
-        return {}
-    if result.returncode != 0:
-        return {}
-
-    line = next((raw.strip() for raw in result.stdout.splitlines() if raw.strip()), "")
-    if not line:
-        return {}
-    parts = line.split(None, 3)
-    if len(parts) != 4:
-        return {}
-    cpu_raw, mem_raw, rss_raw, elapsed = parts
-
-    cpu_text = ""
-    mem_text = ""
-    try:
-        cpu_text = f"{float(cpu_raw):.1f}%"
-    except Exception:
-        pass
-    try:
-        mem_text = f"{float(mem_raw):.1f}%"
-    except Exception:
-        pass
-
-    return {
-        "cpu": cpu_text,
-        "mem": mem_text,
-        "rss": _format_kib_for_status(rss_raw),
-        "elapsed": elapsed.strip(),
-    }
-
-
-def _parts_local_usage_text(scene_name, state=None):
-    if state is None:
-        return ""
-    if not _parts_run_is_active(state, scene_name):
-        return ""
-    stats = _parts_process_stats(scene_name, state)
-    pieces = []
-    if stats.get("cpu"):
-        pieces.append(f"CPU {stats['cpu']}")
-    if stats.get("rss"):
-        pieces.append(f"RAM {stats['rss']}")
-    elif stats.get("mem"):
-        pieces.append(f"MEM {stats['mem']}")
-    return " | ".join(pieces)
 
 
 def _compose_wsl_launch(state, service_key):
@@ -3655,9 +3083,6 @@ def _background_active_probe(scene_name):
     state = _active_state(scene_name)
     if state is None:
         return
-    parts_usage_text = _parts_local_usage_text(scene_name, state)
-    if parts_usage_text != (state.parts_host_usage_text or ""):
-        _emit_status(scene_name, parts_host_usage_text=parts_usage_text)
     api_root = _normalize_api_root(state.api_root)
     snapshot = _active_task_snapshot(api_root)
     status = (snapshot.get("status") or "").lower()
@@ -3830,36 +3255,15 @@ def _import_result(event):
         _show_object_tree(obj)
 
     state = _active_state(event.scene_name)
-    if event.parts_import and state is not None and getattr(state, "parts_new_collection", False):
-        collection_name = (event.collection_name or getattr(state, "parts_collection_name", "") or "Nymphs Parts").strip() or "Nymphs Parts"
-        target_collection = bpy.data.collections.get(collection_name)
-        if target_collection is None:
-            target_collection = bpy.data.collections.new(collection_name)
-            bpy.context.scene.collection.children.link(target_collection)
-        for obj in imported_objects:
-            if obj is None:
-                continue
-            if obj not in target_collection.objects[:]:
-                target_collection.objects.link(obj)
-            for coll in list(obj.users_collection):
-                if coll != target_collection:
-                    try:
-                        coll.objects.unlink(obj)
-                    except Exception:
-                        pass
-
     if event.hide_source and event.source_object_name:
-        source_object_names = _decode_object_name_list(event.source_object_name)
         imported_object = bpy.data.objects.get(imported_names[0]) if imported_names else None
-        source_object = bpy.data.objects.get(source_object_names[0]) if source_object_names else None
+        source_object = bpy.data.objects.get(event.source_object_name)
         if source_object is not None and imported_object is not None:
             imported_object.location = source_object.location
             imported_object.rotation_euler = source_object.rotation_euler
             imported_object.scale = source_object.scale
-        for object_name in source_object_names:
-            source_candidate = bpy.data.objects.get(object_name)
-            if source_candidate is not None:
-                _hide_object_tree(source_candidate)
+        if source_object is not None:
+            _hide_object_tree(source_object)
 
     if state is not None:
         state.is_busy = False
@@ -3876,18 +3280,6 @@ def _import_result(event):
             state.last_result = "Imported latest result"
             state.shape_output_path = event.mesh_path
             state.shape_output_dir = os.path.dirname(event.mesh_path) if event.mesh_path else ""
-            state.latest_result_object_name = _encode_object_name_list([obj.name for obj in latest_roots if obj is not None])
-        else:
-            state.last_result = "Imported parts result"
-            state.parts_started_at = 0.0
-            state.parts_wsl_pid = 0
-            state.parts_host_usage_text = ""
-            state.parts_status_stage = ""
-            state.parts_status_detail = ""
-            state.parts_status_progress = ""
-            state.parts_last_imported_object_name = _encode_object_name_list(
-                [obj.name for obj in latest_roots if obj is not None]
-            )
 
 
 def _job_worker(scene_name, api_root, payload, source_object_name):
@@ -3925,213 +3317,6 @@ def _job_worker(scene_name, api_root, payload, source_object_name):
             generation_request_finished_locally=False,
             status_text=str(exc),
         )
-
-
-def _parts_job_worker(scene_name, state_snapshot, prepared_path, source_object_name, hide_source):
-    state = _active_state(scene_name)
-    _clear_parts_stop_requested(scene_name)
-    backend_choice = (state_snapshot.get("parts_backend_choice") or "P3SAM").upper()
-    backend_label = _parts_backend_label(backend_choice)
-    import_source_object_name = source_object_name
-    if backend_choice == "XPART":
-        prior_parts_import = (state_snapshot.get("parts_last_imported_object_name") or "").strip()
-        if prior_parts_import:
-            import_source_object_name = prior_parts_import
-    output_dir = _parts_result_dir_wsl(
-        state_snapshot,
-        source_name=source_object_name or _path_leaf(prepared_path),
-        backend_label=backend_label,
-    )
-    blender_output_dir = _to_blender_accessible_path(state, output_dir)
-    _emit_status(
-        scene_name,
-        parts_output_dir=blender_output_dir,
-        parts_status_text=f"Starting {backend_label}. Output: {blender_output_dir or output_dir}",
-        parts_status_stage=f"Starting {backend_label}",
-        parts_status_detail=f"Output: {blender_output_dir or output_dir}",
-        parts_status_progress="",
-    )
-    shell, message = _parts_run_shell(state_snapshot, prepared_path, output_dir, backend_choice)
-    if not shell:
-        _emit_status(
-            scene_name,
-            is_busy=False,
-            status_text=message,
-            parts_status_text=message,
-            parts_status_stage="Failed",
-            parts_status_detail=message,
-            parts_status_progress="",
-            parts_started_at=0.0,
-            parts_wsl_pid=0,
-            parts_host_usage_text="",
-        )
-        return
-
-    last_hint = ""
-    recent_lines = []
-    host_log_dir = blender_output_dir or output_dir
-    log_path = os.path.join(host_log_dir, "nymphs_parts_run.log")
-    current_parts_stage = f"Starting {backend_label}"
-    current_parts_detail = f"Output: {blender_output_dir or output_dir}"
-    current_parts_progress = ""
-    log_handle = None
-    try:
-        os.makedirs(host_log_dir, exist_ok=True)
-        log_handle = open(log_path, "w", encoding="utf-8", errors="replace")
-        log_handle.write(f"backend={backend_label}\n")
-        log_handle.write(f"input={prepared_path}\n")
-        log_handle.write(f"output_dir={output_dir}\n\n")
-        log_handle.flush()
-        popen_kwargs = {
-            "stdout": subprocess.PIPE,
-            "stderr": subprocess.STDOUT,
-            "text": True,
-            "bufsize": 1,
-        }
-        if os.name == "nt":
-            popen_kwargs["creationflags"] = (
-                getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-            )
-        else:
-            popen_kwargs["start_new_session"] = True
-        proc = subprocess.Popen(_compose_wsl_invocation(shell, state_snapshot), **popen_kwargs)
-        _set_parts_process(scene_name, proc)
-        _emit_status(
-            scene_name,
-            parts_started_at=time.time(),
-            parts_wsl_pid=0,
-            parts_host_usage_text="",
-            parts_log_path=log_path,
-        )
-        if proc.stdout is not None:
-            for raw_line in proc.stdout:
-                if log_handle is not None:
-                    log_handle.write(raw_line)
-                    log_handle.flush()
-                cleaned = (raw_line or "").replace("\r", "").strip()
-                internal_pid = _parts_internal_pid_from_line(cleaned)
-                if internal_pid > 0:
-                    _emit_status(scene_name, parts_wsl_pid=internal_pid)
-                if cleaned and internal_pid <= 0:
-                    recent_lines.append(cleaned)
-                    recent_lines = recent_lines[-8:]
-                hint_changes = _parts_progress_update(
-                    raw_line,
-                    backend_choice,
-                    current_stage=current_parts_stage,
-                    current_detail=current_parts_detail,
-                    current_progress=current_parts_progress,
-                )
-                if hint_changes:
-                    current_parts_stage = hint_changes.get("parts_status_stage", current_parts_stage)
-                    current_parts_detail = hint_changes.get("parts_status_detail", current_parts_detail)
-                    current_parts_progress = hint_changes.get("parts_status_progress", current_parts_progress)
-                    last_hint = hint_changes.get("parts_status_text", last_hint)
-                    _emit_status(scene_name, **hint_changes)
-        exit_code = proc.wait()
-        stopped_by_user = _consume_parts_stop_requested(scene_name)
-        if exit_code != 0:
-            if stopped_by_user:
-                _emit_status(
-                    scene_name,
-                    is_busy=False,
-                    status_text="Parts run stopped.",
-                    parts_status_text="Parts run stopped.",
-                    parts_status_stage="Stopped",
-                    parts_status_detail="Parts run stopped.",
-                    parts_status_progress="",
-                    parts_output_dir=blender_output_dir,
-                    parts_started_at=0.0,
-                    parts_wsl_pid=0,
-                    parts_host_usage_text="",
-                )
-                return
-            detail = last_hint or (recent_lines[-1] if recent_lines else f"{backend_label} exited with code {exit_code}.")
-            _emit_status(
-                scene_name,
-                is_busy=False,
-                status_text=detail,
-                parts_status_text=f"{detail} Log: {log_path}",
-                parts_status_stage="Failed",
-                parts_status_detail=detail,
-                parts_status_progress="",
-                parts_log_path=log_path,
-                parts_output_dir=blender_output_dir,
-                parts_started_at=0.0,
-                parts_wsl_pid=0,
-                parts_host_usage_text="",
-            )
-            return
-
-        if backend_choice == "XPART":
-            output_path = f"{output_dir}/xpart_parts.glb"
-            done_text = "Part generation finished. Importing result..."
-        else:
-            output_path = f"{output_dir}/p3sam_segmented.glb"
-            done_text = "Parts analysis finished. Importing result..."
-        state = _active_state(scene_name)
-        blender_output_path = _to_blender_accessible_path(state, output_path)
-        if not blender_output_path:
-            raise RuntimeError("Parts run finished, but no output path was produced.")
-        status_changes = {
-            "parts_output_path": blender_output_path,
-            "parts_output_dir": _to_blender_accessible_path(state, output_dir),
-            "status_text": done_text,
-            "parts_status_text": done_text,
-            "parts_status_stage": "Importing Result",
-            "parts_status_detail": done_text,
-            "parts_status_progress": "",
-            "parts_log_path": log_path,
-        }
-        if backend_choice == "P3SAM":
-            manifest_output_path = f"{output_dir}/stage1_manifest.json"
-            summary_output_path = f"{output_dir}/summary.json"
-            status_changes["parts_stage1_manifest_path"] = _to_blender_accessible_path(state, manifest_output_path)
-            status_changes["parts_stage1_summary_path"] = _to_blender_accessible_path(state, summary_output_path)
-        _emit_status(
-            scene_name,
-            **status_changes,
-        )
-        _emit_import(
-            scene_name,
-            blender_output_path,
-            import_source_object_name,
-            hide_source=hide_source,
-            update_shape_result=False,
-            parts_import=(backend_choice == "XPART"),
-            collection_name=(state_snapshot.get("parts_collection_name") or "").strip(),
-        )
-    except Exception as exc:
-        _emit_status(
-            scene_name,
-            is_busy=False,
-            status_text=str(exc),
-            parts_status_text=str(exc),
-            parts_status_stage="Failed",
-            parts_status_detail=str(exc),
-            parts_status_progress="",
-            parts_started_at=0.0,
-            parts_wsl_pid=0,
-            parts_host_usage_text="",
-        )
-    finally:
-        _clear_parts_process(scene_name)
-        _clear_parts_stop_requested(scene_name)
-        if log_handle is not None:
-            try:
-                log_handle.close()
-            except Exception:
-                pass
-        try:
-            prune_state = _active_state(scene_name) or state_snapshot
-            current_output = _to_blender_accessible_path(prune_state, output_dir)
-            _prune_parts_result_dirs(
-                prune_state,
-                keep_recent=state_snapshot.get("parts_keep_recent_runs", 8),
-                extra_preserve={current_output},
-            )
-        except Exception:
-            pass
 
 
 def _imagegen_worker(scene_name, api_root, payload):
@@ -4190,6 +3375,117 @@ def _imagegen_worker(scene_name, api_root, payload):
             imagegen_output_dir=output_dir,
             imagegen_metadata_path=last_metadata_path,
             image_path=last_output_path,
+        )
+    except Exception as exc:
+        _emit_status(
+            scene_name,
+            imagegen_is_busy=False,
+            imagegen_started_at=0.0,
+            imagegen_status_text=str(exc),
+            imagegen_task_status="idle",
+            imagegen_task_stage="",
+            imagegen_task_detail="",
+            imagegen_task_progress="",
+        )
+
+
+def _gemini_imagegen_worker(scene_name, snapshot, prompts):
+    try:
+        prompts = list(prompts) if isinstance(prompts, (list, tuple)) else [prompts]
+        total = len(prompts)
+        last_output_path = ""
+        last_metadata_path = ""
+        output_dir = ""
+        label = snapshot.get("model_label") or "Gemini"
+
+        for index, prompt in enumerate(prompts, start=1):
+            progress = f"{index}/{total}" if total > 1 else ""
+            detail = f"Generating variant {index} of {total}..." if total > 1 else "Generating image..."
+            _emit_status(
+                scene_name,
+                imagegen_task_status="processing",
+                imagegen_task_stage=label,
+                imagegen_task_detail=detail,
+                imagegen_task_progress=progress,
+                imagegen_status_text=detail,
+            )
+            output_path, metadata_path = _gemini_request_image(snapshot, prompt, f"gemini-{index}")
+            last_output_path = output_path
+            last_metadata_path = metadata_path
+            output_dir = os.path.dirname(output_path)
+
+        final_status = "Gemini image generated and assigned to Image."
+        if total > 1:
+            final_status = f"Generated {total} Gemini image variants. Last variant assigned to Image."
+        _emit_status(
+            scene_name,
+            imagegen_is_busy=False,
+            imagegen_started_at=0.0,
+            imagegen_status_text=final_status,
+            imagegen_task_status="idle",
+            imagegen_task_stage="",
+            imagegen_task_detail="",
+            imagegen_task_progress="",
+            imagegen_output_path=last_output_path,
+            imagegen_output_dir=output_dir,
+            imagegen_metadata_path=last_metadata_path,
+            image_path=last_output_path,
+        )
+    except Exception as exc:
+        _emit_status(
+            scene_name,
+            imagegen_is_busy=False,
+            imagegen_started_at=0.0,
+            imagegen_status_text=str(exc),
+            imagegen_task_status="idle",
+            imagegen_task_stage="",
+            imagegen_task_detail="",
+            imagegen_task_progress="",
+        )
+
+
+def _gemini_mv_worker(scene_name, snapshot, prompts):
+    try:
+        assigned = {}
+        metadata_paths = {}
+        folder_path = ""
+        label = snapshot.get("model_label") or "Gemini"
+        for index, (view_key, view_label, prompt) in enumerate(prompts, start=1):
+            progress_text = f"{index}/4"
+            _emit_status(
+                scene_name,
+                imagegen_task_status="processing",
+                imagegen_task_stage=f"{label} {view_label} View",
+                imagegen_task_detail=f"Generating {view_label.lower()} view...",
+                imagegen_task_progress=progress_text,
+                imagegen_status_text=f"Generating {view_label.lower()} view...",
+            )
+            output_path, metadata_path = _gemini_request_image(snapshot, prompt, f"gemini-{view_key}")
+            assigned[view_key] = output_path
+            metadata_paths[view_key] = metadata_path
+            folder_path = os.path.dirname(output_path)
+
+        front_path = assigned.get("front", "")
+        _emit_status(
+            scene_name,
+            imagegen_is_busy=False,
+            imagegen_started_at=0.0,
+            imagegen_status_text="Gemini MV set generated and assigned to multiview slots.",
+            imagegen_task_status="idle",
+            imagegen_task_stage="",
+            imagegen_task_detail="",
+            imagegen_task_progress="",
+            imagegen_output_path=front_path,
+            imagegen_output_dir=folder_path,
+            imagegen_metadata_path=metadata_paths.get("front", ""),
+            imagegen_mv_received_at=time.time(),
+            imagegen_mv_received_source=label,
+            image_path=front_path,
+            mv_front=assigned.get("front", ""),
+            mv_back=assigned.get("back", ""),
+            mv_left=assigned.get("left", ""),
+            mv_right=assigned.get("right", ""),
+            shape_workflow="MULTIVIEW",
         )
     except Exception as exc:
         _emit_status(
@@ -4717,187 +4013,63 @@ class NymphsV2State(bpy.types.PropertyGroup):
     show_image_generation: BoolProperty(default=False)
     show_advanced: BoolProperty(default=False)
     show_shape: BoolProperty(default=False)
-    show_parts: BoolProperty(default=False)
-    show_parts_stage1: BoolProperty(default=False)
-    show_parts_stage2: BoolProperty(default=False)
-    show_parts_support: BoolProperty(default=False)
-    show_parts_status: BoolProperty(default=False)
     show_texture: BoolProperty(default=False)
-    show_parts_backend: BoolProperty(default=False)
-    parts_mode: EnumProperty(
-        name="Parts Mode",
-        description="Experimental future direction for part-aware mesh workflows.",
-        items=(
-            ("SEGMENT", "Segment Parts", "Find semantic regions on the current mesh"),
-            ("DECOMPOSE", "Decompose Parts", "Try generating separated usable parts from the current mesh"),
-        ),
-        default="SEGMENT",
-    )
-    parts_point_num: IntProperty(
-        name="Points",
-        description="Sampled point count for P3-SAM. Lower values reduce VRAM usage but can reduce detail.",
-        default=30000,
-        min=1000,
-        max=200000,
-    )
-    parts_prompt_num: IntProperty(
-        name="Prompts",
-        description="Prompt count for P3-SAM. Lower values reduce VRAM usage and runtime.",
-        default=96,
-        min=8,
-        max=512,
-    )
-    parts_prompt_bs: IntProperty(
-        name="Prompt Batch",
-        description="Prompt batch size for P3-SAM inference. Lower values reduce VRAM usage.",
-        default=4,
-        min=1,
-        max=64,
-    )
-    parts_xpart_steps: IntProperty(
-        name="Steps",
-        description="X-Part diffusion step count. This local default is the current practical 4080 lane, not the heavier upstream default.",
-        default=20,
-        min=1,
-        max=100,
-    )
-    parts_xpart_octree_resolution: IntProperty(
-        name="Octree",
-        description="X-Part export octree resolution. This local default is tuned for the current 4080 lane. Must be at least 256.",
-        default=300,
-        min=256,
-        max=1024,
-    )
-    parts_xpart_max_aabb: IntProperty(
-        name="Max Boxes",
-        description="Cap how many Stage-1 bounding boxes X-Part should use. This local default is tuned for the current 4080 lane.",
-        default=8,
-        min=0,
-        max=64,
-    )
-    parts_xpart_dtype: EnumProperty(
-        name="Precision",
-        description="X-Part execution dtype. The upstream demo uses float32, and it remains the proven stable path here.",
-        items=(
-            ("float32", "Float32", "Upstream demo path and current stable addon path"),
-            ("bfloat16", "BFloat16", "Experimental; current public path is unstable here"),
-            ("float16", "Float16", "Experimental reduced-precision path"),
-        ),
-        default="float32",
-    )
-    parts_xpart_cpu_threads: IntProperty(
-        name="CPU Threads",
-        description="Cap CPU worker threads used by X-Part so it does not overwhelm the desktop. Lower is gentler but slower.",
-        default=8,
-        min=1,
-        max=64,
-    )
-    parts_backend_choice: EnumProperty(
-        name="Backend",
-        description="Which experimental parts backend to target. P3-SAM is the more practical first path. X-Part remains more exploratory.",
-        items=(
-            ("P3SAM", "P3-SAM", "3D part segmentation path"),
-            ("XPART", "X-Part", "Part generation/decomposition path"),
-        ),
-        default="P3SAM",
-    )
-    parts_repo_path: StringProperty(
-        name="Parts Repo Path",
-        description="Local Hunyuan3D-Part repo path used for experimental parts research and future integration.",
-        default=DEFAULT_REPO_PARTS_PATH,
-    )
-    parts_python_path: StringProperty(
-        name="Parts Python",
-        description="Python executable to use for future Hunyuan3D-Part integration. P3-SAM is the first realistic target.",
-        default=DEFAULT_PARTS_PYTHON_PATH,
-    )
-    parts_source_mode: EnumProperty(
-        name="Source",
-        description="Which mesh the experimental parts workflow should use.",
-        items=(
-            ("SELECTED", "Selected Mesh", "Use the currently selected Blender mesh"),
-            ("LATEST", "Latest Result", "Prefer the latest generated mesh when available"),
-        ),
-        default="SELECTED",
-    )
-    parts_export_format: EnumProperty(
-        name="Format",
-        description="Temporary mesh format to prepare for a future parts backend.",
-        items=(
-            ("glb", "GLB", "Preferred default for current mesh workflow experiments"),
-            ("obj", "OBJ", "Useful for compatibility testing with older mesh tools"),
-        ),
-        default="glb",
-    )
-    parts_keep_original: BoolProperty(
-        name="Keep Original Mesh",
-        description="Keep the source mesh in the scene when future parts output is created.",
-        default=False,
-    )
-    parts_keep_recent_runs: IntProperty(
-        name="Keep Recent Runs",
-        description="Auto-prune older Parts run folders after each run. Set to 0 to disable automatic pruning.",
-        default=8,
-        min=0,
-        max=100,
-    )
-    parts_new_collection: BoolProperty(
-        name="Send To New Collection",
-        description="Place future parts output into a separate Blender collection.",
-        default=True,
-    )
-    parts_collection_name: StringProperty(
-        name="Collection Name",
-        description="Collection name to use for future parts output when Send To New Collection is enabled.",
-        default="Nymphs Parts",
-    )
-    parts_status_text: StringProperty(
-        name="Parts Status",
-        default="Idle",
-    )
-    parts_prepared_source_path: StringProperty(
-        name="Prepared Parts Source",
-        default="",
-    )
-    parts_prepared_source_object_name: StringProperty(
-        name="Prepared Parts Source Object",
-        default="",
-    )
-    latest_result_object_name: StringProperty(
-        name="Latest Result Object",
-        default="",
-    )
-    parts_output_path: StringProperty(
-        name="Parts Output",
-        default="",
-    )
-    parts_output_dir: StringProperty(
-        name="Parts Output Dir",
-        default="",
-    )
-    parts_last_imported_object_name: StringProperty(
-        name="Last Parts Import",
-        default="",
-    )
-    parts_stage1_manifest_path: StringProperty(
-        name="Stage-1 Manifest",
-        default="",
-    )
-    parts_stage1_summary_path: StringProperty(
-        name="Stage-1 Summary",
-        default="",
-    )
-    parts_status_stage: StringProperty(default="")
-    parts_status_detail: StringProperty(default="")
-    parts_status_progress: StringProperty(default="")
-    parts_log_path: StringProperty(default="")
-    parts_started_at: FloatProperty(default=0.0)
-    parts_wsl_pid: IntProperty(default=0)
-    parts_host_usage_text: StringProperty(default="")
     imagegen_prompt_text_name: StringProperty(default="")
+    imagegen_backend: EnumProperty(
+        name="Image Backend",
+        description="Choose whether image prompts run on the local Z-Image server or Gemini's Nano Banana image API through OpenRouter.",
+        items=(
+            ("Z_IMAGE", "Z-Image", "Use the local Z-Image backend"),
+            ("GEMINI", "Gemini Flash", "Use Gemini image generation through OpenRouter"),
+        ),
+        default="Z_IMAGE",
+    )
+    openrouter_api_key: StringProperty(
+        name="OpenRouter API Key",
+        description="Optional. Leave blank to use OPENROUTER_API_KEY from the environment.",
+        subtype="PASSWORD",
+        default="",
+    )
+    gemini_model: EnumProperty(
+        name="Gemini Model",
+        description="Gemini image model to call for Nano Banana generation.",
+        items=(
+            ("gemini_2_5_flash_image", "Gemini 2.5 Flash Image", "Nano Banana through OpenRouter. Fast 1024px image generation."),
+            ("gemini_3_1_flash_image_preview", "Gemini 3.1 Flash Image", "Nano Banana 2 preview through OpenRouter. Newer Flash image model with optional larger output sizes."),
+            ("gemini_3_pro_image_preview", "Gemini 3 Pro Image", "Nano Banana Pro preview through OpenRouter for more complex image instructions."),
+        ),
+        default="gemini_2_5_flash_image",
+    )
+    gemini_aspect_ratio: EnumProperty(
+        name="Aspect",
+        description="Gemini output aspect ratio.",
+        items=(
+            ("1:1", "1:1", "Square"),
+            ("2:3", "2:3", "Portrait"),
+            ("3:2", "3:2", "Landscape"),
+            ("3:4", "3:4", "Portrait"),
+            ("4:3", "4:3", "Landscape"),
+            ("4:5", "4:5", "Portrait"),
+            ("5:4", "5:4", "Landscape"),
+            ("9:16", "9:16", "Tall"),
+            ("16:9", "16:9", "Wide"),
+            ("21:9", "21:9", "Ultrawide"),
+        ),
+        default="1:1",
+    )
+    gemini_image_size: EnumProperty(
+        name="Size",
+        description="Output size for Gemini 3.1 Flash Image or Gemini 3 Pro Image. Gemini 2.5 Flash Image always uses its fixed size for the selected aspect ratio.",
+        items=(
+            ("1K", "1K", "Default image size"),
+            ("2K", "2K", "Larger image size"),
+            ("4K", "4K", "Largest image size"),
+        ),
+        default="1K",
+    )
     imagegen_prompt: StringProperty(
         name="Prompt",
-        description="What Z-Image should create. Keep it direct and editable; use Edit for longer text.",
+        description="What the selected image backend should create. Keep it direct and editable; use Edit for longer text.",
         default="",
     )
     imagegen_prompt_preset: EnumProperty(
@@ -5318,21 +4490,6 @@ class NYMPHSV2_OT_stop_backend(bpy.types.Operator):
         for service_key in SERVICE_ORDER:
             ok, _message = _stop_service_process(state, service_key)
             stopped_any = stopped_any or ok
-        stopped_parts = False
-        for scene_name in list(PARTS_ACTIVE_PROCS.keys()):
-            try:
-                if _terminate_parts_process(scene_name):
-                    stopped_parts = True
-                    parts_state = _active_state(scene_name)
-                    if parts_state is not None:
-                        parts_state.parts_status_text = "Stopping parts run..."
-                        parts_state.parts_status_stage = "Stopping"
-                        parts_state.parts_status_detail = parts_state.parts_status_text
-                        parts_state.parts_status_progress = ""
-                        parts_state.status_text = parts_state.parts_status_text
-            except Exception:
-                pass
-        stopped_any = stopped_any or stopped_parts
         if not stopped_any:
             _best_effort_stop_local(state=state)
             state.launch_state = "Stopped"
@@ -5340,11 +4497,6 @@ class NYMPHSV2_OT_stop_backend(bpy.types.Operator):
             state.status_text = "No managed backends were running."
             return {"CANCELLED"}
         state.status_text = "Stop requested."
-        if stopped_parts:
-            state.parts_status_text = "Stopping parts run..."
-            state.parts_status_stage = "Stopping"
-            state.parts_status_detail = state.parts_status_text
-            state.parts_status_progress = ""
         _schedule_event_loop()
         return {"FINISHED"}
 
@@ -5505,7 +4657,7 @@ class NYMPHSV2_OT_run_texture_request(bpy.types.Operator):
 class NYMPHSV2_OT_generate_image(bpy.types.Operator):
     bl_idname = "nymphsv2.generate_image"
     bl_label = "Generate Image"
-    bl_description = "Generate one image through Z-Image and assign it to Image"
+    bl_description = "Generate one image through the selected image backend and assign it to Image"
 
     def execute(self, context):
         state = context.scene.nymphs3d2v2_state
@@ -5513,24 +4665,40 @@ class NYMPHSV2_OT_generate_image(bpy.types.Operator):
             self.report({"WARNING"}, "Another request is already running.")
             return {"CANCELLED"}
 
-        api_root = _normalize_api_root(_service_api_root(state, "n2d2"))
+        backend = getattr(state, "imagegen_backend", "Z_IMAGE")
         try:
-            _require_network_access(api_root)
             variant_count = max(1, int(getattr(state, "imagegen_variant_count", 1)))
-            seed_step = max(1, int(getattr(state, "imagegen_seed_step", 1)))
-            if variant_count > 1:
-                base_seed, generated = _imagegen_seed_value(state)
-                payload = [
-                    _build_imagegen_payload_for_prompt(
-                        state,
-                        prompt=(state.imagegen_prompt or "").strip(),
-                        seed=base_seed + (index * seed_step),
-                    )
-                    for index in range(variant_count)
-                ]
-            else:
-                payload = _build_imagegen_payload(state)
+            if backend == "GEMINI":
+                _require_network_access(OPENROUTER_API_ROOT)
+                prompt = (state.imagegen_prompt or "").strip()
+                if not prompt:
+                    raise RuntimeError("Enter an image-generation prompt first.")
+                snapshot = _gemini_snapshot(state)
+                payload = [prompt for _index in range(variant_count)]
+                worker_target = _gemini_imagegen_worker
+                worker_args = (context.scene.name, snapshot, payload)
                 generated = False
+                base_seed = None
+            else:
+                api_root = _normalize_api_root(_service_api_root(state, "n2d2"))
+                _require_network_access(api_root)
+                seed_step = max(1, int(getattr(state, "imagegen_seed_step", 1)))
+                if variant_count > 1:
+                    base_seed, generated = _imagegen_seed_value(state)
+                    payload = [
+                        _build_imagegen_payload_for_prompt(
+                            state,
+                            prompt=(state.imagegen_prompt or "").strip(),
+                            seed=base_seed + (index * seed_step),
+                        )
+                        for index in range(variant_count)
+                    ]
+                else:
+                    payload = _build_imagegen_payload(state)
+                    generated = False
+                    base_seed = None
+                worker_target = _imagegen_worker
+                worker_args = (context.scene.name, api_root, payload)
         except Exception as exc:
             state.imagegen_status_text = str(exc)
             self.report({"ERROR"}, str(exc))
@@ -5539,11 +4707,12 @@ class NYMPHSV2_OT_generate_image(bpy.types.Operator):
         state.imagegen_is_busy = True
         state.imagegen_started_at = time.time()
         if variant_count > 1:
-            state.imagegen_status_text = f"Generating {variant_count} image variants..."
+            backend_label = "Gemini" if backend == "GEMINI" else "image"
+            state.imagegen_status_text = f"Generating {variant_count} {backend_label} variants..."
             state.imagegen_task_stage = "Generating Variants"
             state.imagegen_task_detail = "Waiting for image backend progress..."
             state.imagegen_task_progress = f"0/{variant_count}"
-            if generated:
+            if generated and base_seed is not None:
                 state.imagegen_seed = str(base_seed)
         else:
             state.imagegen_status_text = "Generating image..."
@@ -5556,8 +4725,8 @@ class NYMPHSV2_OT_generate_image(bpy.types.Operator):
         _touch_ui()
 
         worker = threading.Thread(
-            target=_imagegen_worker,
-            args=(context.scene.name, api_root, payload),
+            target=worker_target,
+            args=worker_args,
             daemon=True,
         )
         worker.start()
@@ -5568,7 +4737,7 @@ class NYMPHSV2_OT_generate_image(bpy.types.Operator):
 class NYMPHSV2_OT_generate_mv_set(bpy.types.Operator):
     bl_idname = "nymphsv2.generate_mv_set"
     bl_label = "Generate MV Set"
-    bl_description = "Generate front, left, right, and back images through Z-Image and assign them to the multiview slots"
+    bl_description = "Generate front, left, right, and back images through the selected image backend and assign them to the multiview slots"
 
     def execute(self, context):
         state = context.scene.nymphs3d2v2_state
@@ -5576,12 +4745,27 @@ class NYMPHSV2_OT_generate_mv_set(bpy.types.Operator):
             self.report({"WARNING"}, "Another request is already running.")
             return {"CANCELLED"}
 
-        api_root = _normalize_api_root(_service_api_root(state, "n2d2"))
+        backend = getattr(state, "imagegen_backend", "Z_IMAGE")
         try:
-            _require_network_access(api_root)
             if not state.imagegen_prompt.strip():
                 raise RuntimeError("Enter an image-generation prompt first.")
-            seed, generated = _imagegen_seed_value(state)
+            if backend == "GEMINI":
+                _require_network_access(OPENROUTER_API_ROOT)
+                snapshot = _gemini_snapshot(state)
+                prompts = [
+                    (view_key, view_label, _build_mv_prompt(state, view_phrase))
+                    for view_key, view_label, view_phrase in IMAGEGEN_MV_VIEW_SPECS
+                ]
+                worker_target = _gemini_mv_worker
+                worker_args = (context.scene.name, snapshot, prompts)
+                generated = False
+                seed = None
+            else:
+                api_root = _normalize_api_root(_service_api_root(state, "n2d2"))
+                _require_network_access(api_root)
+                seed, generated = _imagegen_seed_value(state)
+                worker_target = _imagegen_mv_worker
+                worker_args = (context.scene.name, api_root, seed)
         except Exception as exc:
             state.imagegen_status_text = str(exc)
             self.report({"ERROR"}, str(exc))
@@ -5596,13 +4780,13 @@ class NYMPHSV2_OT_generate_mv_set(bpy.types.Operator):
         state.imagegen_task_progress = "0/4"
         state.imagegen_output_path = ""
         state.imagegen_metadata_path = ""
-        if generated:
+        if generated and seed is not None:
             state.imagegen_seed = str(seed)
         _touch_ui()
 
         worker = threading.Thread(
-            target=_imagegen_mv_worker,
-            args=(context.scene.name, api_root, seed),
+            target=worker_target,
+            args=worker_args,
             daemon=True,
         )
         worker.start()
@@ -6094,389 +5278,6 @@ class NYMPHSV2_OT_clear_shape_folder(bpy.types.Operator):
         return {"FINISHED"}
 
 
-class NYMPHSV2_OT_parts_placeholder_action(bpy.types.Operator):
-    bl_idname = "nymphsv2.parts_placeholder_action"
-    bl_label = "Run Parts Backend"
-    bl_description = "Run the experimental Nymphs Parts workflow"
-
-    backend_choice: StringProperty(
-        name="Backend",
-        default="",
-    )
-
-    def execute(self, context):
-        state = context.scene.nymphs3d2v2_state
-        repo_status = _parts_repo_status(state)
-        if not repo_status["repo_exists"]:
-            state.parts_status_text = "Parts repo path is missing. Set the local Hunyuan3D-Part path first."
-            _touch_ui()
-            self.report({"ERROR"}, state.parts_status_text)
-            return {"CANCELLED"}
-        backend_choice = (self.backend_choice or state.parts_backend_choice or "P3SAM").upper()
-        parts_mode = "SEGMENT" if backend_choice == "P3SAM" else "DECOMPOSE"
-        state.parts_backend_choice = backend_choice
-        state.parts_mode = parts_mode
-        backend_label = _parts_backend_label(backend_choice)
-        if backend_choice == "P3SAM":
-            prepared_path = (state.parts_prepared_source_path or "").strip()
-            if not prepared_path:
-                state.parts_status_text = "Prepare a source mesh first."
-                _touch_ui()
-                self.report({"ERROR"}, state.parts_status_text)
-                return {"CANCELLED"}
-            if not os.path.exists(prepared_path):
-                state.parts_status_text = "Prepared source is missing. Prepare it again."
-                _touch_ui()
-                self.report({"ERROR"}, state.parts_status_text)
-                return {"CANCELLED"}
-            source_ok, source_label = _parts_source_summary(context, state)
-            if not source_ok:
-                state.parts_status_text = source_label
-                _touch_ui()
-                self.report({"ERROR"}, source_label)
-                return {"CANCELLED"}
-            if not repo_status["p3_sam_demo"]:
-                state.parts_status_text = "P3-SAM was not detected in the configured repo. Segmentation is not ready yet."
-                _touch_ui()
-                self.report({"ERROR"}, state.parts_status_text)
-                return {"CANCELLED"}
-            source_object_name = (state.parts_prepared_source_object_name or "").strip()
-            if not source_object_name and (state.parts_source_mode or "SELECTED").upper() == "SELECTED":
-                selected_meshes = [obj for obj in getattr(context, "selected_objects", []) if getattr(obj, "type", "") == "MESH"]
-                active_object = getattr(context, "active_object", None)
-                source_object = active_object if active_object in selected_meshes else (selected_meshes[0] if selected_meshes else None)
-                source_object_name = source_object.name if source_object is not None else ""
-            state.is_busy = True
-            state.status_text = f"Running {backend_label}..."
-            state.parts_status_text = f"Running {backend_label} on {source_label}..."
-            state.task_status = ""
-            state.task_stage = ""
-            state.task_detail = ""
-            state.task_progress = ""
-            state.task_message = ""
-            state.waiting_for_backend_progress = False
-            state.last_result = ""
-            state.parts_output_path = ""
-            state.parts_output_dir = ""
-            state.parts_last_imported_object_name = ""
-            state.parts_stage1_manifest_path = ""
-            state.parts_stage1_summary_path = ""
-            state.parts_status_stage = f"Starting {backend_label}"
-            state.parts_status_detail = f"Running {backend_label} on {source_label}..."
-            state.parts_status_progress = ""
-            state.parts_log_path = ""
-            state.parts_started_at = time.time()
-            state.parts_wsl_pid = 0
-            state.parts_host_usage_text = ""
-            _touch_ui()
-            snapshot = {
-                "wsl_distro_name": _resolved_wsl_distro_name(state),
-                "wsl_user_name": _resolved_wsl_user_name(state),
-                "parts_repo_path": state.parts_repo_path,
-                "parts_python_path": state.parts_python_path,
-                "parts_backend_choice": backend_choice,
-                "parts_point_num": state.parts_point_num,
-                "parts_prompt_num": state.parts_prompt_num,
-                "parts_prompt_bs": state.parts_prompt_bs,
-                "parts_stage1_manifest_path": state.parts_stage1_manifest_path,
-                "parts_keep_recent_runs": state.parts_keep_recent_runs,
-                "parts_new_collection": state.parts_new_collection,
-                "parts_collection_name": state.parts_collection_name,
-                "parts_last_imported_object_name": state.parts_last_imported_object_name,
-            }
-            worker = threading.Thread(
-                target=_parts_job_worker,
-                args=(
-                    context.scene.name,
-                    snapshot,
-                    prepared_path,
-                    source_object_name,
-                    not bool(state.parts_keep_original),
-                ),
-                daemon=True,
-            )
-            worker.start()
-            _schedule_event_loop()
-            return {"FINISHED"}
-        else:
-            manifest_path = (state.parts_stage1_manifest_path or "").strip()
-            if not repo_status["xpart_demo"]:
-                state.parts_status_text = "X-Part code was not detected in the configured repo."
-                _touch_ui()
-                self.report({"ERROR"}, state.parts_status_text)
-                return {"CANCELLED"}
-            if not manifest_path:
-                state.parts_status_text = "Run Analyze Mesh first so X-Part has a Stage-1 manifest."
-                _touch_ui()
-                self.report({"ERROR"}, state.parts_status_text)
-                return {"CANCELLED"}
-            if not os.path.exists(manifest_path):
-                state.parts_status_text = "Stage-1 manifest is missing. Analyze the mesh again."
-                _touch_ui()
-                self.report({"ERROR"}, state.parts_status_text)
-                return {"CANCELLED"}
-            source_object_name = (state.parts_prepared_source_object_name or "").strip()
-            if not source_object_name and (state.parts_source_mode or "SELECTED").upper() == "SELECTED":
-                selected_meshes = [obj for obj in getattr(context, "selected_objects", []) if getattr(obj, "type", "") == "MESH"]
-                active_object = getattr(context, "active_object", None)
-                source_object = active_object if active_object in selected_meshes else (selected_meshes[0] if selected_meshes else None)
-                source_object_name = source_object.name if source_object is not None else ""
-            state.is_busy = True
-            state.status_text = f"Running {backend_label}..."
-            state.parts_status_text = f"Running {backend_label} from Stage-1 analysis..."
-            state.task_status = ""
-            state.task_stage = ""
-            state.task_detail = ""
-            state.task_progress = ""
-            state.task_message = ""
-            state.waiting_for_backend_progress = False
-            state.last_result = ""
-            state.parts_output_path = ""
-            state.parts_output_dir = ""
-            state.parts_status_stage = f"Starting {backend_label}"
-            state.parts_status_detail = f"Running {backend_label} from Stage-1 analysis..."
-            state.parts_status_progress = ""
-            state.parts_log_path = ""
-            state.parts_started_at = time.time()
-            state.parts_wsl_pid = 0
-            state.parts_host_usage_text = ""
-            _touch_ui()
-            snapshot = {
-                "wsl_distro_name": _resolved_wsl_distro_name(state),
-                "wsl_user_name": _resolved_wsl_user_name(state),
-                "parts_repo_path": state.parts_repo_path,
-                "parts_python_path": state.parts_python_path,
-                "parts_backend_choice": backend_choice,
-                "parts_stage1_manifest_path": state.parts_stage1_manifest_path,
-                "parts_xpart_steps": state.parts_xpart_steps,
-                "parts_xpart_octree_resolution": state.parts_xpart_octree_resolution,
-                "parts_xpart_dtype": state.parts_xpart_dtype,
-                "parts_xpart_max_aabb": state.parts_xpart_max_aabb,
-                "parts_xpart_cpu_threads": state.parts_xpart_cpu_threads,
-                "parts_keep_recent_runs": state.parts_keep_recent_runs,
-                "parts_new_collection": state.parts_new_collection,
-                "parts_collection_name": state.parts_collection_name,
-                "parts_last_imported_object_name": state.parts_last_imported_object_name,
-            }
-            worker = threading.Thread(
-                target=_parts_job_worker,
-                args=(
-                    context.scene.name,
-                    snapshot,
-                    manifest_path,
-                    source_object_name,
-                    not bool(state.parts_keep_original),
-                ),
-                daemon=True,
-            )
-            worker.start()
-            _schedule_event_loop()
-            return {"FINISHED"}
-
-
-class NYMPHSV2_OT_prepare_parts_source(bpy.types.Operator):
-    bl_idname = "nymphsv2.prepare_parts_source"
-    bl_label = "Prepare Parts Source"
-    bl_description = "Export or copy a source mesh into a temp file for the experimental parts workflow"
-
-    def execute(self, context):
-        state = context.scene.nymphs3d2v2_state
-        try:
-            prepared_path, source_label, source_object_name = _prepare_parts_source(context, state)
-        except Exception as exc:
-            state.parts_status_text = str(exc)
-            _touch_ui()
-            self.report({"ERROR"}, str(exc))
-            return {"CANCELLED"}
-        state.parts_prepared_source_path = prepared_path
-        state.parts_prepared_source_object_name = source_object_name
-        state.parts_status_text = f"Prepared parts source from {source_label}."
-        _touch_ui()
-        return {"FINISHED"}
-
-
-class NYMPHSV2_OT_open_parts_folder(bpy.types.Operator):
-    bl_idname = "nymphsv2.open_parts_folder"
-    bl_label = "Open Parts Sources"
-    bl_description = "Open the temp folder used for prepared Parts source files"
-
-    def execute(self, context):
-        folder_path = _parts_output_dir()
-        try:
-            bpy.ops.wm.path_open(filepath=folder_path)
-        except Exception as exc:
-            self.report({"ERROR"}, f"Could not open folder: {exc}")
-            return {"CANCELLED"}
-        return {"FINISHED"}
-
-
-class NYMPHSV2_OT_clear_parts_sources_folder(bpy.types.Operator):
-    bl_idname = "nymphsv2.clear_parts_sources_folder"
-    bl_label = "Clear Parts Sources"
-    bl_description = "Delete prepared source mesh files from the Parts temp folder"
-
-    def invoke(self, context, event):
-        return context.window_manager.invoke_confirm(self, event)
-
-    def execute(self, context):
-        state = context.scene.nymphs3d2v2_state
-        if _parts_process_is_active(context.scene.name):
-            self.report({"ERROR"}, "Stop the current Parts run before clearing sources.")
-            return {"CANCELLED"}
-        folder_path = _parts_output_dir()
-        try:
-            _clear_folder_contents(folder_path)
-        except Exception as exc:
-            self.report({"ERROR"}, str(exc))
-            return {"CANCELLED"}
-        state.parts_prepared_source_path = ""
-        state.parts_prepared_source_object_name = ""
-        state.parts_status_text = "Cleared prepared Parts sources."
-        _touch_ui()
-        return {"FINISHED"}
-
-
-class NYMPHSV2_OT_open_parts_outputs_folder(bpy.types.Operator):
-    bl_idname = "nymphsv2.open_parts_outputs_folder"
-    bl_label = "Open Parts Outputs"
-    bl_description = "Open the cached Parts run output folder inside the WSL runtime"
-
-    def execute(self, context):
-        state = context.scene.nymphs3d2v2_state
-        folder_path = _parts_result_root_host(state)
-        if not folder_path:
-            self.report({"ERROR"}, "No Parts output folder is available yet.")
-            return {"CANCELLED"}
-        os.makedirs(folder_path, exist_ok=True)
-        try:
-            bpy.ops.wm.path_open(filepath=folder_path)
-        except Exception as exc:
-            self.report({"ERROR"}, f"Could not open folder: {exc}")
-            return {"CANCELLED"}
-        return {"FINISHED"}
-
-
-class NYMPHSV2_OT_prune_parts_outputs(bpy.types.Operator):
-    bl_idname = "nymphsv2.prune_parts_outputs"
-    bl_label = "Prune Parts Outputs"
-    bl_description = "Delete older Parts run folders while keeping the newest configured set and current references"
-
-    def invoke(self, context, event):
-        return context.window_manager.invoke_confirm(self, event)
-
-    def execute(self, context):
-        state = context.scene.nymphs3d2v2_state
-        if _parts_process_is_active(context.scene.name):
-            self.report({"ERROR"}, "Stop the current Parts run before pruning outputs.")
-            return {"CANCELLED"}
-        try:
-            removed = _prune_parts_result_dirs(state, keep_recent=state.parts_keep_recent_runs)
-        except Exception as exc:
-            self.report({"ERROR"}, str(exc))
-            return {"CANCELLED"}
-        state.parts_status_text = (
-            f"Pruned {removed} Parts run folder{'s' if removed != 1 else ''}. "
-            f"Keeping {state.parts_keep_recent_runs} recent run{'s' if state.parts_keep_recent_runs != 1 else ''}."
-        )
-        _touch_ui()
-        return {"FINISHED"}
-
-
-class NYMPHSV2_OT_clear_parts_outputs_folder(bpy.types.Operator):
-    bl_idname = "nymphsv2.clear_parts_outputs_folder"
-    bl_label = "Clear Parts Outputs"
-    bl_description = "Delete all cached Parts run output folders"
-
-    def invoke(self, context, event):
-        return context.window_manager.invoke_confirm(self, event)
-
-    def execute(self, context):
-        state = context.scene.nymphs3d2v2_state
-        if _parts_process_is_active(context.scene.name):
-            self.report({"ERROR"}, "Stop the current Parts run before clearing outputs.")
-            return {"CANCELLED"}
-        folder_path = _parts_result_root_host(state)
-        try:
-            _clear_folder_contents(folder_path)
-        except Exception as exc:
-            self.report({"ERROR"}, str(exc))
-            return {"CANCELLED"}
-        for attr_name in (
-            "parts_output_path",
-            "parts_output_dir",
-            "parts_stage1_manifest_path",
-            "parts_stage1_summary_path",
-        ):
-            if _path_is_within(folder_path, getattr(state, attr_name, "")):
-                setattr(state, attr_name, "")
-        state.parts_started_at = 0.0
-        state.parts_wsl_pid = 0
-        state.parts_host_usage_text = ""
-        state.parts_last_imported_object_name = ""
-        state.parts_status_stage = ""
-        state.parts_status_detail = ""
-        state.parts_status_progress = ""
-        state.parts_log_path = ""
-        state.parts_status_text = "Cleared cached Parts outputs."
-        _touch_ui()
-        return {"FINISHED"}
-
-
-class NYMPHSV2_OT_open_parts_repo(bpy.types.Operator):
-    bl_idname = "nymphsv2.open_parts_repo"
-    bl_label = "Open Parts Repo"
-    bl_description = "Open the configured Hunyuan3D-Part repo folder"
-
-    def execute(self, context):
-        state = context.scene.nymphs3d2v2_state
-        folder_path = _resolved_user_path(state.parts_repo_path.strip() or DEFAULT_REPO_PARTS_PATH, state)
-        if not os.path.isdir(folder_path):
-            self.report({"ERROR"}, f"Repo folder does not exist: {folder_path}")
-            return {"CANCELLED"}
-        folder_path = _to_blender_accessible_path(state, folder_path)
-        try:
-            bpy.ops.wm.path_open(filepath=folder_path)
-        except Exception as exc:
-            self.report({"ERROR"}, f"Could not open folder: {exc}")
-            return {"CANCELLED"}
-        return {"FINISHED"}
-
-
-class NYMPHSV2_OT_stop_parts_run(bpy.types.Operator):
-    bl_idname = "nymphsv2.stop_parts_run"
-    bl_label = "Stop Parts Run"
-    bl_description = "Stop the current local P3-SAM or X-Part run"
-
-    def execute(self, context):
-        state = context.scene.nymphs3d2v2_state
-        scene_name = context.scene.name
-        if not _parts_process_is_active(scene_name):
-            state.parts_status_text = "No active parts run to stop."
-            state.parts_status_stage = ""
-            state.parts_status_detail = state.parts_status_text
-            state.parts_status_progress = ""
-            state.status_text = state.parts_status_text
-            _touch_ui()
-            self.report({"WARNING"}, state.parts_status_text)
-            return {"CANCELLED"}
-        stopped = _terminate_parts_process(scene_name)
-        if not stopped:
-            state.parts_status_text = "Could not stop the current parts run."
-            state.parts_status_stage = "Failed"
-            state.parts_status_detail = state.parts_status_text
-            state.parts_status_progress = ""
-            state.status_text = state.parts_status_text
-            _touch_ui()
-            self.report({"ERROR"}, state.parts_status_text)
-            return {"CANCELLED"}
-        state.parts_status_text = "Stopping parts run..."
-        state.parts_status_stage = "Stopping"
-        state.parts_status_detail = state.parts_status_text
-        state.parts_status_progress = ""
-        state.status_text = state.parts_status_text
-        _touch_ui()
-        return {"FINISHED"}
-
 
 class NYMPHSV2_PT_server(bpy.types.Panel):
     bl_space_type = "VIEW_3D"
@@ -6518,8 +5319,6 @@ class NYMPHSV2_PT_server(bpy.types.Panel):
             top.label(text=f"Runtimes: {' | '.join(active_services)}"[:160])
         if gpu_summary:
             top.label(text=f"GPU: {gpu_summary}"[:160])
-        if (state.parts_host_usage_text or "").strip():
-            _draw_wrapped_lines(top, state.parts_host_usage_text, prefix="Local Parts: ", width=52, max_lines=2)
         top.label(text=f"Current Job: {current_job}"[:160])
         if current_detail:
             _draw_wrapped_lines(top, current_detail, prefix="Detail: ", width=52, max_lines=2)
@@ -6596,28 +5395,49 @@ class NYMPHSV2_PT_image_generation(bpy.types.Panel):
         if not state.show_image_generation:
             return
 
-        if not _service_runtime_is_available(state, "n2d2"):
+        backend_row = panel.row(align=True)
+        backend_row.prop(state, "imagegen_backend", expand=True)
+        image_backend = getattr(state, "imagegen_backend", "Z_IMAGE")
+
+        if image_backend == "Z_IMAGE" and not _service_runtime_is_available(state, "n2d2"):
             hint = panel.box()
             hint.label(text="Start Z-Image in Runtimes.")
             _draw_service_control_row(hint, state, "n2d2")
             return
 
         _sync_imagegen_prompt_preset(state)
-        _sync_imagegen_settings_preset(state)
+        if image_backend == "Z_IMAGE":
+            _sync_imagegen_settings_preset(state)
 
-        _draw_service_control_row(panel, state, "n2d2")
+        if image_backend == "Z_IMAGE":
+            _draw_service_control_row(panel, state, "n2d2")
+        elif not _online_access_enabled():
+            warning = panel.box()
+            warning.label(text="Enable Blender online access to use Gemini.")
 
         request = panel.box()
 
-        settings_label_row = request.row(align=True)
-        settings_label_row.label(text="Profile")
-        settings_label_row.operator("nymphsv2.load_imagegen_settings_preset", text="Apply")
-        settings_preset_row = request.row(align=True)
-        settings_preset_row.prop(state, "imagegen_settings_preset", text="")
-        settings_preset_tools = request.row(align=True)
-        settings_preset_tools.operator("nymphsv2.save_imagegen_settings_preset", text="Save")
-        settings_preset_tools.operator("nymphsv2.delete_imagegen_settings_preset", text="Delete")
-        settings_preset_tools.operator("nymphsv2.open_imagegen_settings_presets_folder", text="Open")
+        if image_backend == "Z_IMAGE":
+            settings_label_row = request.row(align=True)
+            settings_label_row.label(text="Profile")
+            settings_label_row.operator("nymphsv2.load_imagegen_settings_preset", text="Apply")
+            settings_preset_row = request.row(align=True)
+            settings_preset_row.prop(state, "imagegen_settings_preset", text="")
+            settings_preset_tools = request.row(align=True)
+            settings_preset_tools.operator("nymphsv2.save_imagegen_settings_preset", text="Save")
+            settings_preset_tools.operator("nymphsv2.delete_imagegen_settings_preset", text="Delete")
+            settings_preset_tools.operator("nymphsv2.open_imagegen_settings_presets_folder", text="Open")
+        else:
+            gemini_box = request.box()
+            gemini_box.label(text="Gemini")
+            gemini_box.prop(state, "gemini_model")
+            gemini_box.prop(state, "openrouter_api_key")
+            gemini_row = gemini_box.row(align=True)
+            gemini_row.prop(state, "gemini_aspect_ratio")
+            if _gemini_model_id(state) in GEMINI_IMAGE_SIZE_MODELS:
+                gemini_row.prop(state, "gemini_image_size")
+            if not (state.openrouter_api_key or os.environ.get("OPENROUTER_API_KEY")):
+                gemini_box.label(text="Uses OPENROUTER_API_KEY when the field is blank.")
 
         prompt_preset_label_row = request.row(align=True)
         prompt_preset_label_row.label(text="Prompt Preset")
@@ -6643,18 +5463,20 @@ class NYMPHSV2_PT_image_generation(bpy.types.Panel):
             use_prompt_text.target = "prompt"
         prompt_field_row = request.row(align=True)
         prompt_field_row.prop(state, "imagegen_prompt", text="")
-        size_row = request.row(align=True)
-        size_row.prop(state, "imagegen_width")
-        size_row.prop(state, "imagegen_height")
-        settings_row = request.row(align=True)
-        settings_row.prop(state, "imagegen_steps")
-        settings_row.prop(state, "imagegen_guidance_scale")
+        if image_backend == "Z_IMAGE":
+            size_row = request.row(align=True)
+            size_row.prop(state, "imagegen_width")
+            size_row.prop(state, "imagegen_height")
+            settings_row = request.row(align=True)
+            settings_row.prop(state, "imagegen_steps")
+            settings_row.prop(state, "imagegen_guidance_scale")
 
-        seed_row = request.row(align=True)
-        seed_row.prop(state, "imagegen_seed", text="Seed")
+            seed_row = request.row(align=True)
+            seed_row.prop(state, "imagegen_seed", text="Seed")
         variant_row = request.row(align=True)
         variant_row.prop(state, "imagegen_variant_count")
-        variant_row.prop(state, "imagegen_seed_step", text="Step")
+        if image_backend == "Z_IMAGE":
+            variant_row.prop(state, "imagegen_seed_step", text="Step")
 
         action = request.row(align=True)
         action.enabled = not state.is_busy and not state.imagegen_is_busy
@@ -7233,210 +6055,6 @@ class NYMPHSV2_PT_texture(bpy.types.Panel):
         _draw_request_status(panel, state)
 
 
-class NYMPHSV2_PT_parts(bpy.types.Panel):
-    bl_space_type = "VIEW_3D"
-    bl_region_type = "UI"
-    bl_category = "Nymphs"
-    bl_label = "Nymphs Parts"
-
-    def draw(self, context):
-        state = context.scene.nymphs3d2v2_state
-        layout = self.layout
-        panel = layout.box()
-        panel.prop(
-            state,
-            "show_parts",
-            text="Nymphs Parts",
-            icon="TRIA_DOWN" if state.show_parts else "TRIA_RIGHT",
-            emboss=False,
-        )
-        if not state.show_parts:
-            return
-
-        source_ok, source_label = _parts_source_summary(context, state)
-        repo_status = _parts_repo_status(state)
-        parts_active = _parts_run_is_active(state, context.scene.name)
-
-        backend = panel.box()
-        backend.prop(
-            state,
-            "show_parts_backend",
-            text="Experimental Backend",
-            icon="TRIA_DOWN" if state.show_parts_backend else "TRIA_RIGHT",
-            emboss=False,
-        )
-        if state.show_parts_backend:
-            _draw_labeled_prop(backend, state, "parts_repo_path", "Repo Path")
-            _draw_labeled_prop(backend, state, "parts_python_path", "Python Path")
-            backend.label(text=f"P3-SAM: {'Found' if repo_status['p3_sam_demo'] else 'Missing'}")
-            backend.label(text=f"X-Part: {'Research Only' if repo_status['xpart_demo'] else 'Missing'}")
-            if repo_status["python_exists"]:
-                backend.label(text="Python: Found")
-            else:
-                backend.label(text="Python: Missing")
-            repo_actions = backend.row(align=True)
-            repo_actions.operator("nymphsv2.open_parts_repo", text="Open Repo")
-            repo_actions.operator("nymphsv2.open_parts_outputs_folder", text="Open Outputs")
-            _draw_wrapped_lines(backend, repo_status["summary"], prefix="Status: ", width=44, max_lines=3)
-
-        stage1 = panel.box()
-        stage1.prop(
-            state,
-            "show_parts_stage1",
-            text="Stage 1: Analyze Mesh",
-            icon="TRIA_DOWN" if state.show_parts_stage1 else "TRIA_RIGHT",
-            emboss=False,
-        )
-        if state.show_parts_stage1:
-            source_box = stage1.box()
-            source_box.label(text="Source")
-            source_box.prop(state, "parts_source_mode")
-            if state.parts_source_mode == "SELECTED":
-                source_box.prop(state, "parts_export_format")
-            if source_ok:
-                _draw_wrapped_lines(source_box, source_label, width=44, max_lines=2)
-            else:
-                _draw_wrapped_lines(source_box, source_label, prefix="Missing: ", width=44, max_lines=2)
-            prep = source_box.row(align=True)
-            prep.enabled = source_ok and not parts_active
-            prep.operator("nymphsv2.prepare_parts_source", text="Prepare Source")
-
-            if state.parts_prepared_source_path:
-                prepared = stage1.box()
-                _draw_wrapped_lines(
-                    prepared,
-                    state.parts_prepared_source_path,
-                    prefix="Prepared: ",
-                    width=44,
-                    max_lines=3,
-                )
-
-            _draw_wrapped_lines(
-                stage1,
-                "P3-SAM segments the prepared mesh and writes the Stage-1 bundle X-Part consumes.",
-                width=46,
-                max_lines=2,
-            )
-            stage1_tuning = stage1.column(align=True)
-            stage1_tuning.prop(state, "parts_point_num")
-            stage1_tuning.prop(state, "parts_prompt_num")
-            stage1_tuning.prop(state, "parts_prompt_bs")
-            stage1_action = stage1.row(align=True)
-            stage1_action.enabled = bool((state.parts_prepared_source_path or "").strip()) and repo_status["p3_sam_demo"] and not parts_active
-            analyze_op = stage1_action.operator("nymphsv2.parts_placeholder_action", text="Analyze Mesh")
-            analyze_op.backend_choice = "P3SAM"
-
-            if state.parts_stage1_manifest_path:
-                analysis = stage1.box()
-                _draw_wrapped_lines(
-                    analysis,
-                    state.parts_stage1_manifest_path,
-                    prefix="Analysis: ",
-                    width=44,
-                    max_lines=3,
-                )
-            else:
-                stage1.label(text="No Stage-1 analysis saved yet.")
-
-        stage2 = panel.box()
-        stage2.prop(
-            state,
-            "show_parts_stage2",
-            text="Stage 2: Generate Parts",
-            icon="TRIA_DOWN" if state.show_parts_stage2 else "TRIA_RIGHT",
-            emboss=False,
-        )
-        if state.show_parts_stage2:
-            _draw_wrapped_lines(
-                stage2,
-                "X-Part consumes the latest saved Stage-1 manifest and tries to generate separated parts.",
-                width=46,
-                max_lines=2,
-            )
-            stage2_tuning = stage2.column(align=True)
-            stage2_tuning.prop(state, "parts_xpart_steps")
-            stage2_tuning.prop(state, "parts_xpart_octree_resolution")
-            stage2_tuning.prop(state, "parts_xpart_max_aabb")
-            stage2_tuning.prop(state, "parts_xpart_dtype")
-            stage2_tuning.prop(state, "parts_xpart_cpu_threads")
-            if state.parts_stage1_manifest_path:
-                _draw_wrapped_lines(
-                    stage2,
-                    _path_leaf(state.parts_stage1_manifest_path),
-                    prefix="Using: ",
-                    width=44,
-                    max_lines=2,
-                )
-            else:
-                stage2.label(text="Run Stage 1 first.")
-            stage2_action = stage2.row(align=True)
-            stage2_action.enabled = bool((state.parts_stage1_manifest_path or "").strip()) and repo_status["xpart_demo"] and not parts_active
-            generate_op = stage2_action.operator("nymphsv2.parts_placeholder_action", text="Generate Parts")
-            generate_op.backend_choice = "XPART"
-
-        if state.parts_output_path:
-            result_box = panel.box()
-            _draw_wrapped_lines(
-                result_box,
-                state.parts_output_path,
-                prefix="Last Result: ",
-                width=44,
-                max_lines=3,
-            )
-
-        support = panel.box()
-        support.prop(
-            state,
-            "show_parts_support",
-            text="Import & Storage",
-            icon="TRIA_DOWN" if state.show_parts_support else "TRIA_RIGHT",
-            emboss=False,
-        )
-        if state.show_parts_support:
-            support.prop(state, "parts_keep_original")
-            support.prop(state, "parts_new_collection")
-            if state.parts_new_collection:
-                support.prop(state, "parts_collection_name")
-            support.prop(state, "parts_keep_recent_runs")
-            source_actions = support.row(align=True)
-            source_actions.enabled = not parts_active
-            source_actions.operator("nymphsv2.open_parts_folder", text="Open Sources")
-            source_actions.operator("nymphsv2.clear_parts_sources_folder", text="Clear Sources")
-            output_actions = support.row(align=True)
-            output_actions.enabled = not parts_active
-            output_actions.operator("nymphsv2.open_parts_outputs_folder", text="Open Outputs")
-            output_actions.operator("nymphsv2.prune_parts_outputs", text="Prune Outputs")
-            clear_outputs = support.row(align=True)
-            clear_outputs.enabled = not parts_active
-            clear_outputs.operator("nymphsv2.clear_parts_outputs_folder", text="Clear Outputs")
-
-        status = panel.box()
-        status.prop(
-            state,
-            "show_parts_status",
-            text="Run Status",
-            icon="TRIA_DOWN" if state.show_parts_status else "TRIA_RIGHT",
-            emboss=False,
-        )
-        if state.show_parts_status:
-            action = status.row(align=True)
-            stop_op = action.row(align=True)
-            stop_op.enabled = parts_active
-            stop_op.operator("nymphsv2.stop_parts_run", text="Stop Parts Run")
-            if state.parts_host_usage_text:
-                _draw_wrapped_lines(status, state.parts_host_usage_text, prefix="Load: ", width=46, max_lines=2)
-            if state.parts_wsl_pid:
-                status.label(text=f"PID: {state.parts_wsl_pid}")
-            if (state.parts_status_stage or "").strip():
-                _draw_wrapped_lines(status, state.parts_status_stage, prefix="Stage: ", width=46, max_lines=2)
-            if (state.parts_status_detail or "").strip():
-                _draw_wrapped_lines(status, state.parts_status_detail, prefix="Detail: ", width=46, max_lines=3)
-            if (state.parts_status_progress or "").strip():
-                _draw_wrapped_lines(status, state.parts_status_progress, prefix="Progress: ", width=46, max_lines=2)
-            _draw_wrapped_lines(status, state.parts_status_text, prefix="Status: ", width=46, max_lines=3)
-            if (state.parts_log_path or "").strip():
-                _draw_wrapped_lines(status, state.parts_log_path, prefix="Log: ", width=46, max_lines=3)
-
 
 CLASSES = (
     NymphsV2State,
@@ -7470,19 +6088,9 @@ CLASSES = (
     NYMPHSV2_OT_clear_imagegen_folder,
     NYMPHSV2_OT_open_shape_folder,
     NYMPHSV2_OT_clear_shape_folder,
-    NYMPHSV2_OT_prepare_parts_source,
-    NYMPHSV2_OT_open_parts_folder,
-    NYMPHSV2_OT_clear_parts_sources_folder,
-    NYMPHSV2_OT_open_parts_outputs_folder,
-    NYMPHSV2_OT_prune_parts_outputs,
-    NYMPHSV2_OT_clear_parts_outputs_folder,
-    NYMPHSV2_OT_open_parts_repo,
-    NYMPHSV2_OT_stop_parts_run,
-    NYMPHSV2_OT_parts_placeholder_action,
     NYMPHSV2_PT_server,
     NYMPHSV2_PT_image_generation,
     NYMPHSV2_PT_shape,
-    NYMPHSV2_PT_parts,
     NYMPHSV2_PT_texture,
 )
 
