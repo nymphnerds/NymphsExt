@@ -5,7 +5,7 @@ Live Blender addon implementation for Nymphs.
 bl_info = {
     "name": "Nymphs",
     "author": "Nymphs3D",
-    "version": (1, 1, 114),
+    "version": (1, 1, 115),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Nymphs",
     "description": "Blender client for NymphsCore image, shape, and texture backends",
@@ -15,6 +15,7 @@ bl_info = {
 import base64
 import atexit
 import json
+import mimetypes
 import ntpath
 import os
 import queue
@@ -133,22 +134,23 @@ IMAGEGEN_PROMPT_PRESETS = {
     },
     "character_part_breakout": {
         "label": "Character Part Breakout",
-        "description": "Generates separate body, hair, clothing, weapon, and prop reference images from a character description",
+        "description": "Generates separate anatomy base, hair, clothing, weapon, and prop reference images from a character description",
         "prompt": (
             "Create separate standalone asset reference images from the character description below. "
             "Do not make a parts sheet, lineup, grid, collage, catalog page, or multi-item layout. "
             "Each generated image must contain exactly one thing from the character design. "
-            "One image should be the complete uncensored nude base character body in a neutral A-pose or T-pose, "
-            "centered, head-to-toe visible, with no clothing, armor, accessories, weapons, hair, censor bars, black bars, "
-            "blur, stickers, or coverings. "
-            "Hair must be generated as its own separate standalone image, never attached to the nude base body. "
+            "One image should be the complete neutral anatomy base body for a game asset in a clean A-pose or T-pose, "
+            "centered, head-to-toe visible, with simplified non-explicit anatomy suitable for base mesh modeling reference, "
+            "no clothing, armor, accessories, weapons, hair, censor bars, black bars, blur, stickers, or coverings. "
+            "Hair must be generated as its own separate standalone image, never attached to the anatomy base body. "
             "Every other generated image should be exactly one isolated character part: one hairstyle or hair asset, "
             "one clothing garment, one armor piece, one accessory, one weapon, or one carried object from the same character design. "
             "If multiple images or variants are requested, make each image a different single item, starting with "
-            "the nude base body, then hair as its own separate image, then separate wearable or carried items. "
+            "the anatomy base body, then hair as its own separate image, then separate wearable or carried items. "
+            "For the anatomy base body, keep it neutral, front-readable, uncluttered, and appropriate as a base mesh game asset reference. "
             "For hair, clothing, armor, accessories, weapons, and props, show only the item itself, centered, complete, "
             "unobstructed, and not worn by a person or mannequin. "
-            "Do not combine the nude body with hair, clothing, or props in the same image. "
+            "Do not combine the anatomy base body with hair, clothing, or props in the same image. "
             "Use a plain light background, soft even studio lighting, clean readable silhouette, clear materials, "
             "and game asset concept art styling suitable for 3D modeling reference. "
             "No duplicate items, no text, no labels, no scenery. "
@@ -1424,6 +1426,17 @@ def _imagegen_output_path(provider="image", suffix=".png"):
     return os.path.join(_imagegen_output_dir(), f"{stamp}-{stem}-{int(time.time() * 1000) % 100000}{suffix}")
 
 
+def _current_imagegen_folder(state):
+    folder_path = (getattr(state, "imagegen_output_dir", "") or "").strip()
+    if not folder_path:
+        output_path = (getattr(state, "imagegen_output_path", "") or "").strip()
+        if output_path:
+            folder_path = os.path.dirname(output_path)
+    if folder_path:
+        return folder_path
+    return _imagegen_output_dir()
+
+
 def _clear_folder_contents(folder_path):
     target = (folder_path or "").strip()
     if not target:
@@ -1547,6 +1560,46 @@ def _gemini_model_label(model_id):
     return "Gemini 2.5 Flash Image"
 
 
+def _gemini_guide_image_path(state_or_snapshot):
+    if isinstance(state_or_snapshot, dict):
+        path = (state_or_snapshot.get("guide_image_path") or "").strip()
+    else:
+        enabled = bool(getattr(state_or_snapshot, "gemini_use_guide_image", False))
+        path = (getattr(state_or_snapshot, "gemini_guide_image_path", "") or "").strip() if enabled else ""
+    if not path:
+        return ""
+    return bpy.path.abspath(path).strip()
+
+
+def _gemini_guide_image_data_url(raw_path):
+    path = bpy.path.abspath((raw_path or "").strip())
+    if not path:
+        raise RuntimeError("Pick a guide image first.")
+    if not os.path.isfile(path):
+        raise RuntimeError(f"Guide image not found: {path}")
+
+    mime_type, _encoding = mimetypes.guess_type(path)
+    if mime_type not in {"image/png", "image/jpeg", "image/webp", "image/gif"}:
+        suffix = os.path.splitext(path)[1].lower()
+        if suffix in {".jpg", ".jpeg"}:
+            mime_type = "image/jpeg"
+        elif suffix == ".png":
+            mime_type = "image/png"
+        elif suffix == ".webp":
+            mime_type = "image/webp"
+        elif suffix == ".gif":
+            mime_type = "image/gif"
+        else:
+            raise RuntimeError("Guide image must be a PNG, JPG, WEBP, or GIF file.")
+
+    try:
+        with open(path, "rb") as handle:
+            encoded = base64.b64encode(handle.read()).decode("ascii")
+    except Exception as exc:
+        raise RuntimeError(f"Could not read guide image: {exc}") from exc
+    return path, f"data:{mime_type};base64,{encoded}"
+
+
 def _gemini_api_key(state):
     key = (getattr(state, "openrouter_api_key", "") or "").strip()
     if key:
@@ -1565,9 +1618,14 @@ def _gemini_snapshot(state):
         "model_label": _gemini_model_label(model_id),
         "aspect_ratio": (getattr(state, "gemini_aspect_ratio", "1:1") or "1:1").strip(),
         "image_size": (getattr(state, "gemini_image_size", "1K") or "1K").strip(),
+        "guide_image_path": "",
+        "guide_image_data_url": "",
     }
     if model_id not in GEMINI_IMAGE_SIZE_MODELS:
         snapshot["image_size"] = ""
+    guide_image_path = _gemini_guide_image_path(state)
+    if guide_image_path:
+        snapshot["guide_image_path"], snapshot["guide_image_data_url"] = _gemini_guide_image_data_url(guide_image_path)
     return snapshot
 
 
@@ -1596,7 +1654,8 @@ def _character_part_breakout_variant_prompts(base_prompt, variant_count):
     for index in range(max(1, variant_count)):
         if index == 0:
             instructions.append(
-                "Request target: render only the nude base body in a neutral A-pose or T-pose. "
+                "Request target: render only the neutral anatomy base body in a clean A-pose or T-pose for a game asset base mesh reference. "
+                "Use simplified non-explicit anatomy. "
                 "No hair, no clothing, no accessories, no weapons, no props."
             )
         elif index == 1:
@@ -1642,12 +1701,27 @@ def _gemini_request_image(snapshot, prompt, output_label):
     if model_id in GEMINI_IMAGE_SIZE_MODELS and snapshot.get("image_size"):
         image_config["image_size"] = snapshot["image_size"]
 
+    message_content = prompt
+    if snapshot.get("guide_image_data_url"):
+        message_content = [
+            {
+                "type": "text",
+                "text": prompt,
+            },
+            {
+                "type": "image_url",
+                "imageUrl": {
+                    "url": snapshot["guide_image_data_url"],
+                },
+            },
+        ]
+
     payload = {
         "model": model_id,
         "messages": [
             {
                 "role": "user",
-                "content": prompt,
+                "content": message_content,
             }
         ],
         "modalities": ["image", "text"],
@@ -1671,7 +1745,15 @@ def _gemini_request_image(snapshot, prompt, output_label):
 
     text_parts = []
     image_urls = []
+    finish_reasons = []
+    native_finish_reasons = []
     for choice in detail.get("choices", []) or []:
+        finish_reason = (choice.get("finish_reason") or "").strip()
+        if finish_reason:
+            finish_reasons.append(finish_reason)
+        native_finish_reason = (choice.get("native_finish_reason") or "").strip()
+        if native_finish_reason:
+            native_finish_reasons.append(native_finish_reason)
         message = choice.get("message") or {}
         if message.get("content"):
             text_parts.append(str(message["content"]).strip())
@@ -1682,9 +1764,15 @@ def _gemini_request_image(snapshot, prompt, output_label):
 
     if not image_urls:
         reason = (detail.get("error") or {}).get("message", "")
-        message = "Gemini did not return an image."
+        message = "Nano did not return an image."
         if reason:
             message += f" {reason}"
+        if native_finish_reasons:
+            unique_native = ", ".join(dict.fromkeys(native_finish_reasons))
+            message += f" Provider finish reason: {unique_native}."
+        elif finish_reasons:
+            unique_finish = ", ".join(dict.fromkeys(finish_reasons))
+            message += f" Finish reason: {unique_finish}."
         if text_parts:
             message += f" Response: {' '.join(text_parts)[:500]}"
         raise RuntimeError(message)
@@ -1704,6 +1792,7 @@ def _gemini_request_image(snapshot, prompt, output_label):
             "prompt": prompt,
             "aspect_ratio": snapshot.get("aspect_ratio") or "1:1",
             "image_size": snapshot.get("image_size") or "",
+            "guide_image_path": snapshot.get("guide_image_path") or "",
             "mime_type": mime_type,
             "image_index": image_index,
             "image_count": total_images,
@@ -2185,6 +2274,36 @@ def _path_leaf(raw_path):
     return cleaned.replace("\\", "/").rsplit("/", 1)[-1]
 
 
+def _current_image_backend_label(state):
+    backend = (getattr(state, "imagegen_backend", "Z_IMAGE") or "Z_IMAGE").strip()
+    if backend == "GEMINI":
+        return "Nano"
+    return SERVICE_LABELS["n2d2"]
+
+
+def _current_image_backend_detail(state):
+    backend = (getattr(state, "imagegen_backend", "Z_IMAGE") or "Z_IMAGE").strip()
+    if backend != "GEMINI":
+        return ""
+    parts = []
+    model_label = _gemini_model_label(_gemini_model_id(state))
+    if model_label:
+        parts.append(model_label)
+    aspect = (getattr(state, "gemini_aspect_ratio", "") or "").strip()
+    if aspect:
+        parts.append(f"Aspect {aspect}")
+    if _gemini_model_id(state) in GEMINI_IMAGE_SIZE_MODELS:
+        size = (getattr(state, "gemini_image_size", "") or "").strip()
+        if size:
+            parts.append(f"Size {size}")
+    if bool(getattr(state, "gemini_use_guide_image", False)):
+        guide_path = _gemini_guide_image_path(state)
+        parts.append(f"Guide {_path_leaf(guide_path) or 'selected'}" if guide_path else "Guide On")
+    else:
+        parts.append("Guide Off")
+    return " | ".join(parts)
+
+
 def _format_elapsed_time(started_at):
     try:
         started = float(started_at or 0.0)
@@ -2276,12 +2395,14 @@ def _imagegen_progress_lines(state):
     active_status = (state.imagegen_task_status or "").lower()
     has_live_task = active_status in {"processing", "queued"}
     elapsed = _format_elapsed_time(getattr(state, "imagegen_started_at", 0.0))
+    backend_label = _current_image_backend_label(state)
     if not state.imagegen_is_busy and not has_live_task:
         return "", "", ""
     stage = (state.imagegen_task_stage or "").strip()
     detail = (state.imagegen_task_detail or state.imagegen_status_text or "").strip()
     progress = (state.imagegen_task_progress or "").strip()
-    runtime_hint = _service_runtime_hint(state, "n2d2")
+    runtime_hint = _service_runtime_hint(state, "n2d2") if backend_label == SERVICE_LABELS["n2d2"] else ""
+    backend_detail = _current_image_backend_detail(state)
     generic_detail = {
         "",
         "Generating image...",
@@ -2290,6 +2411,8 @@ def _imagegen_progress_lines(state):
     }
     if runtime_hint and detail in generic_detail:
         detail = runtime_hint
+    elif backend_detail and detail in generic_detail:
+        detail = backend_detail
     if active_status not in {"processing", "queued"}:
         if state.imagegen_is_busy:
             progress = f"Elapsed {elapsed}" if elapsed else ""
@@ -2302,7 +2425,7 @@ def _imagegen_progress_lines(state):
     stage_key = stage.strip().lower()
     if stage_key in {"generating image", "generating_image"}:
         progress = f"Elapsed {elapsed}" if elapsed else ""
-        return "Running Inference", detail or "Running image model inference...", progress
+        return "Running Inference", detail or f"Running {backend_label} image model inference...", progress
     return stage or "Generating Image", detail, progress
 
 
@@ -2376,6 +2499,7 @@ def _server_status_line(state):
         backend_label = _backend_display_name(_launch_backend_label(state))
     active_status = (state.task_status or "").lower()
     image_status = (state.imagegen_task_status or "").lower()
+    image_backend_label = _current_image_backend_label(state)
     active_services = _active_service_entries(state)
     if state.launch_state == "Launching":
         return f"{backend_label} Launching"
@@ -2386,9 +2510,9 @@ def _server_status_line(state):
     if active_status == "queued" or state.waiting_for_backend_progress:
         return f"{backend_label} Submitting"
     if image_status == "processing":
-        return f"{SERVICE_LABELS['n2d2']} Busy"
+        return f"{image_backend_label} Busy"
     if image_status == "queued" or state.imagegen_is_busy:
-        return f"{SERVICE_LABELS['n2d2']} Submitting"
+        return f"{image_backend_label} Submitting"
     if len(active_services) > 1:
         service_states = {service_status for _service_key, service_status in active_services}
         if service_states == {"Ready"}:
@@ -3498,7 +3622,7 @@ def _gemini_imagegen_worker(scene_name, snapshot, prompts, assign_first_output=F
         last_output_path = ""
         last_metadata_path = ""
         output_dir = ""
-        label = snapshot.get("model_label") or "Gemini"
+        label = snapshot.get("model_label") or "Nano"
 
         for index, prompt in enumerate(prompts, start=1):
             progress = f"{index}/{total}" if total > 1 else ""
@@ -3523,12 +3647,12 @@ def _gemini_imagegen_worker(scene_name, snapshot, prompts, assign_first_output=F
 
         assigned_output_path = first_output_path if assign_first_output and first_output_path else last_output_path
         assigned_metadata_path = first_metadata_path if assign_first_output and first_metadata_path else last_metadata_path
-        final_status = "Gemini image generated and assigned to Image."
+        final_status = "Nano image generated and assigned to Image."
         if generated_images > 1:
             final_status = (
-                f"Generated {generated_images} Gemini images. First breakout image assigned to Image."
+                f"Generated {generated_images} Nano images. First breakout image assigned to Image."
                 if assign_first_output
-                else f"Generated {generated_images} Gemini images. Last image assigned to Image."
+                else f"Generated {generated_images} Nano images. Last image assigned to Image."
             )
         _emit_status(
             scene_name,
@@ -3562,7 +3686,7 @@ def _gemini_mv_worker(scene_name, snapshot, prompts):
         assigned = {}
         metadata_paths = {}
         folder_path = ""
-        label = snapshot.get("model_label") or "Gemini"
+        label = snapshot.get("model_label") or "Nano"
         for index, (view_key, view_label, prompt) in enumerate(prompts, start=1):
             progress_text = f"{index}/4"
             _emit_status(
@@ -3573,7 +3697,10 @@ def _gemini_mv_worker(scene_name, snapshot, prompts):
                 imagegen_task_progress=progress_text,
                 imagegen_status_text=f"Generating {view_label.lower()} view...",
             )
-            output_path, metadata_path = _gemini_request_image(snapshot, prompt, f"gemini-{view_key}")
+            saved_outputs = _gemini_request_image(snapshot, prompt, f"gemini-{view_key}")
+            if not saved_outputs:
+                raise RuntimeError(f"Nano did not return a {view_label.lower()} view image.")
+            output_path, metadata_path = saved_outputs[0]
             assigned[view_key] = output_path
             metadata_paths[view_key] = metadata_path
             folder_path = os.path.dirname(output_path)
@@ -3583,7 +3710,7 @@ def _gemini_mv_worker(scene_name, snapshot, prompts):
             scene_name,
             imagegen_is_busy=False,
             imagegen_started_at=0.0,
-            imagegen_status_text="Gemini MV set generated and assigned to multiview slots.",
+            imagegen_status_text="Nano MV set generated and assigned to multiview slots.",
             imagegen_task_status="idle",
             imagegen_task_stage="",
             imagegen_task_detail="",
@@ -4138,20 +4265,31 @@ class NymphsV2State(bpy.types.PropertyGroup):
         default="Z_IMAGE",
     )
     openrouter_api_key: StringProperty(
-        name="OpenRouter API Key",
-        description="Optional. Leave blank to use OPENROUTER_API_KEY from the environment.",
+        name="API",
+        description="OpenRouter API key for Nano image generation. Leave blank to use OPENROUTER_API_KEY from the environment instead.",
         subtype="PASSWORD",
         default="",
     )
     gemini_model: EnumProperty(
-        name="Gemini Model",
-        description="Gemini image model to call for Nano Banana generation.",
+        name="Model",
+        description="Nano image model to call through OpenRouter.",
         items=(
             ("gemini_2_5_flash_image", "Gemini 2.5 Flash Image", "Nano Banana through OpenRouter. Fast 1024px image generation."),
             ("gemini_3_1_flash_image_preview", "Gemini 3.1 Flash Image", "Nano Banana 2 preview through OpenRouter. Newer Flash image model with optional larger output sizes."),
             ("gemini_3_pro_image_preview", "Gemini 3 Pro Image", "Nano Banana Pro preview through OpenRouter for more complex image instructions."),
         ),
         default="gemini_2_5_flash_image",
+    )
+    gemini_use_guide_image: BoolProperty(
+        name="Guide Image",
+        description="Send one picked image along with the prompt so Nano can edit from or stay closer to an existing design.",
+        default=False,
+    )
+    gemini_guide_image_path: StringProperty(
+        name="Guide",
+        description="Image file to send with the Nano prompt. Use Pick to choose from the current generated-image folder.",
+        subtype="FILE_PATH",
+        default="",
     )
     gemini_aspect_ratio: EnumProperty(
         name="Aspect",
@@ -4832,18 +4970,19 @@ class NYMPHSV2_OT_generate_image(bpy.types.Operator):
 
         state.imagegen_is_busy = True
         state.imagegen_started_at = time.time()
+        image_backend_label = _current_image_backend_label(state)
+        image_backend_detail = _current_image_backend_detail(state)
         if variant_count > 1:
-            backend_label = "Gemini" if backend == "GEMINI" else "image"
-            state.imagegen_status_text = f"Generating {variant_count} {backend_label} variants..."
+            state.imagegen_status_text = f"Generating {variant_count} {image_backend_label} variants..."
             state.imagegen_task_stage = "Generating Variants"
-            state.imagegen_task_detail = "Waiting for image backend progress..."
+            state.imagegen_task_detail = image_backend_detail or "Waiting for image backend progress..."
             state.imagegen_task_progress = f"0/{variant_count}"
             if generated and base_seed is not None:
                 state.imagegen_seed = str(base_seed)
         else:
-            state.imagegen_status_text = "Generating image..."
-            state.imagegen_task_stage = "Generating Image"
-            state.imagegen_task_detail = "Waiting for image backend progress..."
+            state.imagegen_status_text = f"Generating {image_backend_label} image..."
+            state.imagegen_task_stage = f"{image_backend_label} Image"
+            state.imagegen_task_detail = image_backend_detail or "Waiting for image backend progress..."
             state.imagegen_task_progress = ""
         state.imagegen_task_status = "queued"
         state.imagegen_output_path = ""
@@ -4899,10 +5038,12 @@ class NYMPHSV2_OT_generate_mv_set(bpy.types.Operator):
 
         state.imagegen_is_busy = True
         state.imagegen_started_at = time.time()
-        state.imagegen_status_text = "Generating MV set..."
+        image_backend_label = _current_image_backend_label(state)
+        image_backend_detail = _current_image_backend_detail(state)
+        state.imagegen_status_text = f"Generating {image_backend_label} MV set..."
         state.imagegen_task_status = "queued"
         state.imagegen_task_stage = "Generating MV Set"
-        state.imagegen_task_detail = "Preparing front, left, right, and back prompts..."
+        state.imagegen_task_detail = image_backend_detail or "Preparing front, left, right, and back prompts..."
         state.imagegen_task_progress = "0/4"
         state.imagegen_output_path = ""
         state.imagegen_metadata_path = ""
@@ -5313,16 +5454,62 @@ class NYMPHSV2_OT_edit_image_prompts(bpy.types.Operator):
         return {"FINISHED"}
 
 
-class NYMPHSV2_OT_open_imagegen_folder(bpy.types.Operator):
-    bl_idname = "nymphsv2.open_imagegen_folder"
-    bl_label = "Open Folder"
-    bl_description = "Open the folder that contains the generated Z-Image images"
+class NYMPHSV2_OT_pick_gemini_guide_image(bpy.types.Operator):
+    bl_idname = "nymphsv2.pick_gemini_guide_image"
+    bl_label = "Pick Guide Image"
+    bl_description = "Choose a guide image for Nano from the current generated-image folder"
+
+    filepath: StringProperty(subtype="FILE_PATH")
+    filter_glob: StringProperty(default="*.png;*.jpg;*.jpeg;*.webp;*.gif", options={"HIDDEN"})
+
+    def invoke(self, context, event):
+        state = context.scene.nymphs_state
+        current_path = _gemini_guide_image_path(state)
+        if current_path and os.path.isfile(current_path):
+            self.filepath = current_path
+        else:
+            self.filepath = os.path.join(_current_imagegen_folder(state), "")
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
 
     def execute(self, context):
         state = context.scene.nymphs_state
-        folder_path = (state.imagegen_output_dir or "").strip()
-        if not folder_path and state.imagegen_output_path.strip():
-            folder_path = os.path.dirname(state.imagegen_output_path.strip())
+        selected_path = bpy.path.abspath((self.filepath or "").strip())
+        if not selected_path:
+            self.report({"ERROR"}, "Pick a guide image first.")
+            return {"CANCELLED"}
+        try:
+            normalized_path, _data_url = _gemini_guide_image_data_url(selected_path)
+        except Exception as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        state.gemini_guide_image_path = normalized_path
+        state.gemini_use_guide_image = True
+        _touch_ui()
+        return {"FINISHED"}
+
+
+class NYMPHSV2_OT_clear_gemini_guide_image(bpy.types.Operator):
+    bl_idname = "nymphsv2.clear_gemini_guide_image"
+    bl_label = "Clear Guide"
+    bl_description = "Clear the Nano guide image path"
+
+    def execute(self, context):
+        state = context.scene.nymphs_state
+        state.gemini_guide_image_path = ""
+        state.gemini_use_guide_image = False
+        _touch_ui()
+        return {"FINISHED"}
+
+
+class NYMPHSV2_OT_open_imagegen_folder(bpy.types.Operator):
+    bl_idname = "nymphsv2.open_imagegen_folder"
+    bl_label = "Open Folder"
+    bl_description = "Open the folder that contains the generated images"
+
+    def execute(self, context):
+        state = context.scene.nymphs_state
+        folder_path = _current_imagegen_folder(state)
         if not folder_path:
             self.report({"ERROR"}, "No generated image folder is available yet.")
             return {"CANCELLED"}
@@ -5344,9 +5531,7 @@ class NYMPHSV2_OT_clear_imagegen_folder(bpy.types.Operator):
 
     def execute(self, context):
         state = context.scene.nymphs_state
-        folder_path = (state.imagegen_output_dir or "").strip()
-        if not folder_path and state.imagegen_output_path.strip():
-            folder_path = os.path.dirname(state.imagegen_output_path.strip())
+        folder_path = _current_imagegen_folder(state)
         try:
             _clear_folder_contents(folder_path)
         except Exception as exc:
@@ -5445,6 +5630,10 @@ class NYMPHSV2_PT_server(bpy.types.Panel):
             top.label(text=f"Runtimes: {' | '.join(active_services)}"[:160])
         if gpu_summary:
             top.label(text=f"GPU: {gpu_summary}"[:160])
+        top.label(text=f"Image Backend: {_current_image_backend_label(state)}"[:160])
+        image_backend_detail = _current_image_backend_detail(state)
+        if image_backend_detail:
+            _draw_wrapped_lines(top, image_backend_detail, prefix="Image Detail: ", width=52, max_lines=2)
         top.label(text=f"Current Job: {current_job}"[:160])
         if current_detail:
             _draw_wrapped_lines(top, current_detail, prefix="Detail: ", width=52, max_lines=2)
@@ -5555,13 +5744,22 @@ class NYMPHSV2_PT_image_generation(bpy.types.Panel):
             settings_preset_tools.operator("nymphsv2.open_imagegen_settings_presets_folder", text="Open")
         else:
             gemini_box = request.box()
-            gemini_box.label(text="Gemini")
-            gemini_box.prop(state, "gemini_model")
-            gemini_box.prop(state, "openrouter_api_key")
+            nano_row = gemini_box.row(align=True)
+            nano_row.label(text="Nano")
+            nano_row.prop(state, "gemini_model", text="")
+            gemini_box.prop(state, "openrouter_api_key", text="API")
             gemini_row = gemini_box.row(align=True)
             gemini_row.prop(state, "gemini_aspect_ratio")
             if _gemini_model_id(state) in GEMINI_IMAGE_SIZE_MODELS:
                 gemini_row.prop(state, "gemini_image_size")
+            guide_box = gemini_box.box()
+            guide_toggle_row = guide_box.row(align=True)
+            guide_toggle_row.prop(state, "gemini_use_guide_image")
+            if state.gemini_use_guide_image:
+                guide_box.prop(state, "gemini_guide_image_path", text="Guide")
+                guide_actions = guide_box.row(align=True)
+                guide_actions.operator("nymphsv2.pick_gemini_guide_image", text="Pick")
+                guide_actions.operator("nymphsv2.clear_gemini_guide_image", text="Clear")
             if not (state.openrouter_api_key or os.environ.get("OPENROUTER_API_KEY")):
                 gemini_box.label(text="Uses OPENROUTER_API_KEY when the field is blank.")
 
@@ -6210,6 +6408,8 @@ CLASSES = (
     NYMPHSV2_OT_open_image_prompt_text_block,
     NYMPHSV2_OT_pull_image_prompt_text_block,
     NYMPHSV2_OT_edit_image_prompts,
+    NYMPHSV2_OT_pick_gemini_guide_image,
+    NYMPHSV2_OT_clear_gemini_guide_image,
     NYMPHSV2_OT_open_imagegen_folder,
     NYMPHSV2_OT_clear_imagegen_folder,
     NYMPHSV2_OT_open_shape_folder,
