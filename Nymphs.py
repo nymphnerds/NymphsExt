@@ -5,7 +5,7 @@ Live Blender addon implementation for Nymphs.
 bl_info = {
     "name": "Nymphs",
     "author": "Nymphs3D",
-    "version": (1, 1, 117),
+    "version": (1, 1, 118),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Nymphs",
     "description": "Blender client for NymphsCore image, shape, and texture backends",
@@ -4561,7 +4561,6 @@ class NymphsV2State(bpy.types.PropertyGroup):
         name="Styles",
         description="Pick a reusable style fragment to inject into the generated prompt.",
         items=_imagegen_style_preset_items,
-        default=DEFAULT_IMAGEGEN_STYLE_PRESET,
     )
     imagegen_settings_preset: EnumProperty(
         name="Generation Profile",
