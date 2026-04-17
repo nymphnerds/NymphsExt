@@ -41,6 +41,7 @@ Useful image tools:
 
 - prompt and negative prompt fields
 - saved prompt presets
+- `Character Part Breakout` preset for generating one standalone clothing, weapon, accessory, or prop image at a time from a full character description
 - generation profiles for size, steps, seed, guidance, and variant count
 - four-view multiview generation for front, back, left, and right references
 - open and clear buttons for generated image folders

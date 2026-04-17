@@ -5,7 +5,7 @@ Live Blender addon implementation for NymphsCore.
 bl_info = {
     "name": "NymphsCore",
     "author": "Nymphs3D",
-    "version": (1, 1, 110),
+    "version": (1, 1, 111),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Nymphs",
     "description": "Blender client for NymphsCore image, shape, and texture backends",
@@ -128,6 +128,22 @@ IMAGEGEN_PROMPT_PRESETS = {
             "single original character concept, full body, centered, head to toe visible, clean silhouette, "
             "simple plain light background, soft even lighting, readable costume design, clear limb separation, "
             "appealing stylized proportions, no scenery, no props crossing the body, high quality game character concept art"
+        ),
+    },
+    "character_part_breakout": {
+        "label": "Character Part Breakout",
+        "description": "Generates one separate clothing, weapon, or prop asset per image from a character description",
+        "prompt": (
+            "Create a standalone asset image from the character description below. "
+            "Do not draw the full character. Do not make a parts sheet, lineup, grid, collage, catalog page, or multi-item layout. "
+            "Each generated image must contain exactly one isolated character part: one clothing garment, one armor piece, "
+            "one accessory, one weapon, or one carried object from the described character. "
+            "If multiple images or variants are requested, make each image a different single item from the same character design. "
+            "Show only the selected item, centered, complete, unobstructed, and separate from the body. "
+            "Use a plain light background, soft even studio lighting, clean readable silhouette, clear materials, "
+            "and game asset concept art styling suitable for 3D modeling reference. "
+            "No person, no mannequin, no body parts, no model wearing the item, no duplicate items, no text, no labels, no scenery. "
+            "Character description: "
         ),
     },
     "creature_asset": {

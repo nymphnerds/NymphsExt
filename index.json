@@ -7,7 +7,7 @@
       "id": "nymphs3d2",
       "name": "NymphsCore",
       "tagline": "Blender client for NymphsCore image, shape, and texture backends",
-      "version": "1.1.110",
+      "version": "1.1.111",
       "type": "add-on",
       "maintainer": "Babyjawz <babyjaws@gmail.com>",
       "license": [
@@ -22,9 +22,9 @@
       "platforms": [
         "windows-x64"
       ],
-      "archive_url": "./nymphscore-1.1.110.zip",
-      "archive_size": 43444,
-      "archive_hash": "sha256:15ed8412c3a49edacbde3c686dac6dc0a5556e717e4d556155ee6d4cfebac7d0"
+      "archive_url": "./nymphscore-1.1.111.zip",
+      "archive_size": 43871,
+      "archive_hash": "sha256:fb0406ea00c5afb328df4bb1cae661a38f74e54f7eb8e8d0edad7a1707e61857"
     }
   ]
 }
