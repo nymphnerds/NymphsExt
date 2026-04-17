@@ -1,6 +1,6 @@
-"""Live Blender addon entrypoint for NymphsCore."""
+"""Live Blender addon entrypoint for Nymphs."""
 
 try:
-    from .Nymphs3D2 import *  # noqa: F401,F403
+    from .Nymphs import *  # noqa: F401,F403
 except ImportError:
-    from Nymphs3D2 import *  # type: ignore # noqa: F401,F403
+    from Nymphs import *  # type: ignore # noqa: F401,F403

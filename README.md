@@ -1,6 +1,6 @@
-# NymphsCore Blender Extension
+# Nymphs Blender Extension
 
-NymphsCore adds a Blender sidebar workflow for creating image references, generating a textured mesh, and retexturing the result when it needs another pass.
+Nymphs adds a Blender sidebar workflow for creating image references, generating a textured mesh, and retexturing the result when it needs another pass.
 
 ## Install From This Feed
 
@@ -12,10 +12,10 @@ NymphsCore adds a Blender sidebar workflow for creating image references, genera
    https://raw.githubusercontent.com/nymphnerds/NymphsExt/main/index.json
    ```
 
-4. Install `NymphsCore`.
+4. Install `Nymphs`.
 5. Open the 3D View sidebar and use the `Nymphs` tabs.
 
-The current test package is `1.1.110`. The Blender extension id remains `nymphs3d2` so existing test installs can update from the same feed.
+The current test package is `1.1.112`. The Blender extension id is `nymphs`.
 
 ## Workflow
 
@@ -41,7 +41,7 @@ Useful image tools:
 
 - prompt and negative prompt fields
 - saved prompt presets
-- `Character Part Breakout` preset for generating one standalone clothing, weapon, accessory, or prop image at a time from a full character description
+- `Character Part Breakout` preset for separate body, clothing, weapon, accessory, and prop references from one character description
 - generation profiles for size, steps, seed, guidance, and variant count
 - four-view multiview generation for front, back, left, and right references
 - open and clear buttons for generated image folders
@@ -79,7 +79,7 @@ Typical flow:
 
 ## Runtime
 
-NymphsCore is built around the managed `NymphsCore` WSL runtime and the `nymph` user created by the Windows Manager.
+Nymphs uses the managed `NymphsCore` WSL runtime and the `nymph` user created by the Windows Manager.
 
 Use the `Nymphs Runtimes` panel to start, stop, and probe:
 
@@ -91,4 +91,4 @@ The retired Hunyuan Parts / P3-SAM / X-Part workflow is no longer included.
 
 ## Outputs
 
-NymphsCore keeps generated images, meshes, and metadata in local output folders. Use the panel folder buttons to open or clear those folders while testing builds from this feed.
+Nymphs keeps generated images, meshes, and metadata in local output folders. Use the panel folder buttons to open or clear those folders while testing builds from this feed.
