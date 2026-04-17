@@ -24,7 +24,7 @@ NymphsCore is built around the managed `NymphsCore` WSL runtime and the `nymph` 
 Use the `Nymphs Runtimes` panel to start, stop, and probe:
 
 - `TRELLIS.2` for image-to-3D shape and texture work
-- `Hunyuan 2mv` for the alternate 3D backend
+- `Hunyuan 2mv` for multiview mesh generation from front, back, and side images
 - `Z-Image` for local prompt-to-image generation
 
 The retired Hunyuan Parts / P3-SAM / X-Part workflow is no longer included.
@@ -48,16 +48,23 @@ Useful image tools:
 
 ## Shape Generation
 
-The `Nymphs Shape` panel sends the selected source image to the chosen 3D backend and imports the returned mesh into Blender.
+The `Nymphs Shape` panel sends the selected source images to the chosen 3D backend and imports the returned mesh into Blender.
 
-Recommended path:
+Recommended single-image path:
 
 1. Start `TRELLIS.2` in `Nymphs Runtimes`.
 2. Generate or choose an image.
 3. Run shape generation from the `Nymphs Shape` panel.
 4. Adjust TRELLIS guidance presets when a prompt needs more or less image adherence.
 
-`Hunyuan 2mv` remains available as an alternate backend when that workflow gives better results for a model.
+Recommended multiview path:
+
+1. Create or choose front, back, left, and right reference images.
+2. Start `Hunyuan 2mv` in `Nymphs Runtimes`.
+3. Send the multiview set from the `Nymphs Shape` panel.
+4. Use the imported mesh as the base model for cleanup or texturing.
+
+`Hunyuan 2mv` is intended for cases where multiple aligned views describe the object better than one image can.
 
 ## Texture Generation
 
