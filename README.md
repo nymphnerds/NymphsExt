@@ -1,6 +1,6 @@
 # NymphsCore Blender Extension
 
-NymphsCore adds a Blender sidebar workflow for generating reference images, turning images into 3D shapes, and retexturing selected meshes through the NymphsCore runtime.
+NymphsCore adds a Blender sidebar workflow for creating image references, generating a textured mesh, and retexturing the result when it needs another pass.
 
 ## Install From This Feed
 
@@ -17,21 +17,20 @@ NymphsCore adds a Blender sidebar workflow for generating reference images, turn
 
 The current test package is `1.1.110`. The Blender extension id remains `nymphs3d2` so existing test installs can update from the same feed.
 
-## Runtime
+## Workflow
 
-NymphsCore is built around the managed `NymphsCore` WSL runtime and the `nymph` user created by the Windows Manager.
+1. Generate image references in `Nymphs Image`.
+2. Generate the mesh and first texture pass in `Nymphs Shape`.
+3. Retexture the selected mesh in `Nymphs Texture` if the first texture needs another pass.
+4. Open the output folders when you want to inspect saved images, meshes, or metadata.
 
-Use the `Nymphs Runtimes` panel to start, stop, and probe:
-
-- `TRELLIS.2` for image-to-3D shape and texture work
-- `Hunyuan 2mv` for multiview mesh generation from front, back, and side images
-- `Z-Image` for local prompt-to-image generation
-
-The retired Hunyuan Parts / P3-SAM / X-Part workflow is no longer included.
+Start with a single prompt image when the object is simple. Use a front, back, left, and right image set when the shape needs multiple views.
 
 ## Image Generation
 
-The `Nymphs Image` panel supports two image backends:
+The `Nymphs Image` panel is the first step. It creates the reference image or multiview set that drives the rest of the workflow.
+
+Image backends:
 
 - `Z-Image`, the default local backend running in the managed runtime
 - `Gemini Flash`, using OpenRouter for Nano Banana / Gemini image models
@@ -46,18 +45,18 @@ Useful image tools:
 - four-view multiview generation for front, back, left, and right references
 - open and clear buttons for generated image folders
 
-## Shape Generation
+## Shape And Texture Generation
 
-The `Nymphs Shape` panel sends the selected source images to the chosen 3D backend and imports the returned mesh into Blender.
+The `Nymphs Shape` panel turns the generated image references into a mesh and first texture result, then imports the returned model into Blender.
 
-Recommended single-image path:
+Single-image path:
 
 1. Start `TRELLIS.2` in `Nymphs Runtimes`.
 2. Generate or choose an image.
 3. Run shape generation from the `Nymphs Shape` panel.
 4. Adjust TRELLIS guidance presets when a prompt needs more or less image adherence.
 
-Recommended multiview path:
+Multiview path:
 
 1. Create or choose front, back, left, and right reference images.
 2. Start `Hunyuan 2mv` in `Nymphs Runtimes`.
@@ -66,9 +65,9 @@ Recommended multiview path:
 
 `Hunyuan 2mv` is intended for cases where multiple aligned views describe the object better than one image can.
 
-## Texture Generation
+## Retexture
 
-The `Nymphs Texture` panel retextures the selected mesh using an image prompt and the selected texture backend.
+The `Nymphs Texture` panel is the optional cleanup pass after shape generation. Use it when the imported mesh is good but the texture needs a different reference image or another pass.
 
 Typical flow:
 
@@ -76,6 +75,18 @@ Typical flow:
 2. Choose a texture reference image.
 3. Start `TRELLIS.2` or `Hunyuan 2mv`.
 4. Run the texture request and inspect the imported result.
+
+## Runtime
+
+NymphsCore is built around the managed `NymphsCore` WSL runtime and the `nymph` user created by the Windows Manager.
+
+Use the `Nymphs Runtimes` panel to start, stop, and probe:
+
+- `Z-Image` for local prompt-to-image generation
+- `TRELLIS.2` for single-image shape, texture, and retexture work
+- `Hunyuan 2mv` for multiview mesh generation from front, back, left, and right images
+
+The retired Hunyuan Parts / P3-SAM / X-Part workflow is no longer included.
 
 ## Outputs
 
