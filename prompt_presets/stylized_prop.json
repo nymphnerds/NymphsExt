@@ -1,5 +1,5 @@
 {
-  "name": "Stylized Prop",
-  "description": "Painterly prop/object prompt for game assets",
-  "prompt": "single stylized game prop, centered, isolated on a plain light background, clean silhouette, hand-painted fantasy asset style, readable materials, simple appealing shapes, soft even lighting, clear front-facing design, no scenery, no text, high quality concept art"
+  "name": "Prop Asset",
+  "description": "Readable prop/object prompt for game assets",
+  "prompt": "single game prop asset, centered, isolated on a plain light background, clean silhouette, readable materials, simple appealing shapes, soft even lighting, clear front-facing design, no scenery, no text"
 }

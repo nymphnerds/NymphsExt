@@ -5,7 +5,7 @@ Live Blender addon implementation for Nymphs.
 bl_info = {
     "name": "Nymphs",
     "author": "Nymphs3D",
-    "version": (1, 1, 118),
+    "version": (1, 1, 141),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Nymphs",
     "description": "Blender client for NymphsCore image, shape, and texture backends",
@@ -35,6 +35,7 @@ from urllib.request import Request, urlopen
 import bpy
 from bpy.props import (
     BoolProperty,
+    CollectionProperty,
     EnumProperty,
     FloatProperty,
     IntProperty,
@@ -68,6 +69,8 @@ LOG_PREFIX_RE = re.compile(r"^\d{4}-\d{2}-\d{2}[^\|]*\|\s*[A-Z]+\s*\|\s*(?:stdou
 LOCAL_SHAPE_OUTPUT_DIRNAME = "nymphs_shape_outputs"
 LOCAL_IMAGEGEN_OUTPUT_DIRNAME = "nymphs_image_outputs"
 CACHE_MISS = object()
+PART_GUIDANCE_SYNC_GUARD = False
+IMAGEGEN_PROMPT_SYNC_GUARD = False
 
 DEFAULT_WSL_DISTRO = "NymphsCore"
 DEFAULT_WSL_USER = "nymph"
@@ -87,15 +90,38 @@ GEMINI_MODEL_IDS = {
     "gemini_3_1_flash_image_preview": "google/gemini-3.1-flash-image-preview",
     "gemini_3_pro_image_preview": "google/gemini-3-pro-image-preview",
 }
+GEMINI_PLANNER_MODEL_IDS = {
+    "gemini_2_5_flash": "google/gemini-2.5-flash",
+    "gemini_3_1_pro_preview": "google/gemini-3.1-pro-preview",
+}
+DEFAULT_PART_EXTRACTION_GUIDANCE = (
+    "Preserve the exact illustration style, proportions, color palette, material details, and scale relationship from the reference image. "
+    "Preserve the character's inferred body type and silhouette proportions from the master image, including short, squat, stout, bulky, chibi, or stylized proportions when present. "
+    "Do not replace the character with a generic slim adult anatomy template. "
+    "Match the same line weight, brush texture, paper texture, color softness, rendering flatness, and level of detail. "
+    "Use the same media feel as the source image on a simple plain background. "
+    "Do not convert the result into a 3D render, product render, glossy material render, realistic render, toy render, or studio product photo. "
+    "Do not include unrelated body parts, heads, mannequins, labels, extra objects, scenery, or shadows."
+)
 GEMINI_IMAGE_SIZE_MODELS = {
     "google/gemini-3.1-flash-image-preview",
     "google/gemini-3-pro-image-preview",
 }
 DEFAULT_IMAGEGEN_PROMPT_PRESET = "clean_asset_concept"
 DEFAULT_IMAGEGEN_PROMPT_TEXT_NAME = "Nymphs Image Prompt"
+DEFAULT_PART_EXTRACTION_GUIDANCE_TEXT_NAME = "Nymphs Part Extraction Guidance"
 PACKAGED_IMAGEGEN_PROMPT_PRESET_DIR = "prompt_presets"
 DEFAULT_IMAGEGEN_STYLE_PRESET = "__none__"
 PACKAGED_IMAGEGEN_STYLE_PRESET_DIR = "style_presets"
+PROMPT_KIND_SUBJECT = "subject"
+PROMPT_KIND_STYLE = "style"
+PROMPT_KIND_SAVED = "saved"
+PROMPT_KIND_LABELS = {
+    PROMPT_KIND_SUBJECT: "Subject",
+    PROMPT_KIND_STYLE: "Style",
+    PROMPT_KIND_SAVED: "Saved Prompt",
+}
+NO_PROMPT_PRESET_KEY = "__none__"
 WSL_DISTRO_ITEMS = []
 N2D2_PRESET_SYNC_GUARD = False
 N2D2_AUTORESTART_GUARD = False
@@ -107,31 +133,46 @@ IMAGEGEN_MV_VIEW_SPECS = (
 )
 IMAGEGEN_PROMPT_PRESETS = {
     "clean_asset_concept": {
-        "label": "Clean Asset Concept",
+        "label": "Clean Asset Reference",
         "description": "General-purpose asset prompt for props, creatures, buildings, and objects",
         "prompt": (
-            "single game asset concept, centered subject, isolated on a plain light background, "
+            "single game asset reference, centered subject, isolated on a plain light background, "
             "clean readable silhouette, whole subject visible, consistent design, soft even lighting, "
-            "minimal shadows, no scenery, no text, high quality concept art, clear shape language, "
+            "minimal shadows, no scenery, no text, clear shape language, "
             "designed for 3D modeling reference"
         ),
     },
     "stylized_prop": {
-        "label": "Stylized Prop",
-        "description": "Painterly prop/object prompt for game assets",
+        "label": "Prop Asset",
+        "description": "Readable prop/object prompt for game assets",
         "prompt": (
-            "single stylized game prop, centered, isolated on a plain light background, clean silhouette, "
-            "hand-painted fantasy asset style, readable materials, simple appealing shapes, soft even lighting, "
-            "clear front-facing design, no scenery, no text, high quality concept art"
+            "single game prop asset, centered, isolated on a plain light background, clean silhouette, "
+            "readable materials, simple appealing shapes, soft even lighting, "
+            "clear front-facing design, no scenery, no text"
         ),
     },
     "character_asset": {
         "label": "Character Asset",
         "description": "Readable full-character prompt for image-to-3D workflows",
         "prompt": (
-            "single original character concept, full body, centered, head to toe visible, clean silhouette, "
+            "single original character reference, full body, centered, head to toe visible, clean silhouette, "
             "simple plain light background, soft even lighting, readable costume design, clear limb separation, "
-            "appealing stylized proportions, no scenery, no props crossing the body, high quality game character concept art"
+            "appealing proportions, no scenery, no props crossing the body, designed for 3D modeling reference"
+        ),
+    },
+    "character_master_reference": {
+        "label": "Character Master Reference",
+        "description": "Full-character master image for guided part extraction",
+        "prompt": (
+            "Create one complete master character reference image from the character description below. "
+            "Show the full character as one cohesive design, centered, head to toe visible, front-readable, "
+            "with the complete outfit, hair, facial hair, weapons, accessories, and carried props included together. "
+            "Use a clean plain light background, soft even lighting, readable silhouette, clear materials, and enough space around the character. "
+            "This image will be used as the canonical source for later guided part extraction, so keep the design consistent and complete. "
+            "Critical exclusions: do not make a parts sheet, grid, collage, lineup, turnaround, catalog page, or separate item layout. "
+            "Do not split the clothing, hair, weapons, or props into separate images. "
+            "Do not add labels, text, scenery, extra characters, duplicate versions, or extra floating items. "
+            "Character description: "
         ),
     },
     "character_part_breakout": {
@@ -139,11 +180,10 @@ IMAGEGEN_PROMPT_PRESETS = {
         "description": "Generates separate anatomy base, hair, clothing, weapon, and prop reference images from a character description",
         "prompt": (
             "Create separate standalone asset reference images from the character description below. "
-            "Do not make a parts sheet, lineup, grid, collage, catalog page, or multi-item layout. "
             "Each generated image must contain exactly one thing from the character design. "
             "One image should be the complete neutral anatomy base body for a game asset in a clean A-pose or T-pose, "
             "centered, head-to-toe visible, with simplified non-explicit anatomy suitable for base mesh modeling reference, "
-            "no clothing, armor, accessories, weapons, hair, censor bars, black bars, blur, stickers, or coverings. "
+            "with no clothing, armor, accessories, weapons, hair, censor bars, black bars, blur, stickers, or coverings. "
             "Hair must be generated as its own separate standalone image, never attached to the anatomy base body. "
             "Every other generated image should be exactly one isolated character part: one hairstyle or hair asset, "
             "one clothing garment, one armor piece, one accessory, one weapon, or one carried object from the same character design. "
@@ -153,11 +193,12 @@ IMAGEGEN_PROMPT_PRESETS = {
             "For the anatomy base body, keep it neutral, front-readable, uncluttered, and appropriate as a base mesh game asset reference. "
             "For hair, clothing, armor, accessories, weapons, and props, show only the item itself, centered, complete, "
             "unobstructed, and not worn by a person or mannequin. "
+            "Use a plain light background, soft even studio lighting, clean readable silhouette, clear materials, "
+            "and asset-reference framing suitable for 3D modeling. "
+            "Critical exclusions: do not make a parts sheet, lineup, grid, collage, catalog page, or multi-item layout. "
             "Do not combine the anatomy base body with hair, clothing, or props in the same image. "
             "Never place more than one item in the same image. "
-            "Use a plain light background, soft even studio lighting, clean readable silhouette, clear materials, "
-            "and game asset concept art styling suitable for 3D modeling reference. "
-            "No duplicate items, no text, no labels, no scenery. "
+            "No duplicate items, no text, no labels, no scenery, and no mannequin unless structurally unavoidable. "
             "Character description: "
         ),
     },
@@ -165,27 +206,27 @@ IMAGEGEN_PROMPT_PRESETS = {
         "label": "Creature Asset",
         "description": "Creature/monster prompt with a readable whole-body shape",
         "prompt": (
-            "single fantasy creature concept, whole creature visible, centered, isolated on a plain light background, "
+            "single creature reference, whole creature visible, centered, isolated on a plain light background, "
             "clean readable silhouette, clear anatomy, distinctive shape language, soft even lighting, minimal shadows, "
-            "stylized game art, designed as a 3D creature reference, no scenery, no text"
+            "designed as a 3D creature reference, no scenery, no text"
         ),
     },
     "building_asset": {
         "label": "Building Asset",
         "description": "Isolated building or environment-piece prompt",
         "prompt": (
-            "single stylized building asset, centered, isolated on a plain light background, full structure visible, "
+            "single building asset, centered, isolated on a plain light background, full structure visible, "
             "clean silhouette, readable roof and wall shapes, clear material zones, soft even lighting, "
-            "fantasy game environment concept art, designed for 3D modeling reference, no surrounding scene, no text"
+            "designed for 3D modeling reference, no surrounding scene, no text"
         ),
     },
     "hard_surface_asset": {
         "label": "Hard Surface Asset",
         "description": "Vehicle, machine, robot, or sci-fi object prompt",
         "prompt": (
-            "single hard-surface asset concept, centered, isolated on a plain light background, whole object visible, "
+            "single hard-surface asset reference, centered, isolated on a plain light background, whole object visible, "
             "clean silhouette, readable mechanical forms, consistent proportions, clear panel lines and material breaks, "
-            "soft studio lighting, high quality game asset concept art, no scenery, no text"
+            "soft studio lighting, designed for 3D modeling reference, no scenery, no text"
         ),
     },
 }
@@ -251,10 +292,29 @@ IMAGEGEN_STYLE_PRESETS = {
     },
     "storybook_inkwash": {
         "label": "Storybook Inkwash",
-        "description": "Soft storybook illustration with watercolor and ink",
+        "description": "Strong ink-and-wash storybook illustration style",
         "style": (
-            "storybook illustration, graceful ink outlines, soft watercolor textures, gentle fantasy palette, "
-            "hand-painted illustrative finish"
+            "strong storybook ink-and-wash illustration style, visible black ink contour lines, loose brush ink details, "
+            "transparent watercolor washes, paper texture, gentle muted fantasy palette, hand-painted traditional media finish, "
+            "not 3D render, not plastic, not glossy, not photorealistic"
+        ),
+    },
+    "japanese_watercolor_woodblock": {
+        "label": "Japanese Watercolor Woodblock",
+        "description": "Ukiyo-e inspired watercolor and woodblock print styling",
+        "style": (
+            "Japanese watercolor woodblock print style, ukiyo-e inspired composition, elegant carved ink outlines, "
+            "flat layered color washes, subtle washi paper texture, restrained natural palette, decorative but readable silhouette, "
+            "traditional printmaking feel, not 3D render, not glossy, not photorealistic"
+        ),
+    },
+    "minimalist_chinese_watercolor": {
+        "label": "Minimalist Chinese Watercolor",
+        "description": "Sparse Chinese ink-wash watercolor styling",
+        "style": (
+            "minimalist Chinese watercolor and ink-wash painting style, sparse expressive brushwork, soft mineral watercolor washes, "
+            "generous negative space, delicate ink contours, calm restrained palette, xieyi-inspired simplicity, rice paper texture, "
+            "not 3D render, not glossy, not photorealistic"
         ),
     },
 }
@@ -751,6 +811,8 @@ def _drain_events():
                 for key, value in payload_b.items():
                     setattr(state, key, value)
                 _sync_shape_texture_state(state)
+                if "part_extraction_plan_json" in payload_b:
+                    _sync_part_extraction_items_from_plan(state)
         elif kind == "import":
             _import_result(payload_a)
 
@@ -921,6 +983,235 @@ def _on_n2d2_model_config_changed(self, context):
     _restart_n2d2_after_model_change(context, self)
 
 
+def _openrouter_config_path():
+    config_dir = bpy.utils.user_resource("CONFIG", path="nymphs", create=True)
+    return os.path.join(config_dir, "openrouter.json")
+
+
+def _load_openrouter_api_key_config():
+    try:
+        with open(_openrouter_config_path(), "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except Exception:
+        return ""
+    return str(data.get("api_key") or "").strip()
+
+
+def _save_openrouter_api_key_config(api_key):
+    try:
+        path = _openrouter_config_path()
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"api_key": (api_key or "").strip()}, handle, indent=2)
+            handle.write("\n")
+    except Exception:
+        pass
+
+
+def _on_openrouter_api_key_changed(self, context):
+    _save_openrouter_api_key_config(getattr(self, "openrouter_api_key", ""))
+
+
+def _ensure_openrouter_api_key_loaded(state):
+    if (getattr(state, "openrouter_api_key", "") or "").strip():
+        return
+    api_key = _load_openrouter_api_key_config()
+    if api_key:
+        try:
+            state.openrouter_api_key = api_key
+        except Exception:
+            pass
+
+
+def _part_guidance_block_lines():
+    return {
+        "base_face": [
+            "Keep facial structure on the anatomy base.",
+            "Match the source character's nose, mouth, cheeks, jaw, and brow structure.",
+            "Do not simplify the whole head into a blank mannequin if Face is enabled.",
+        ],
+        "eyes_in_base": [
+            "Keep finished eyes on the anatomy base.",
+            "Match source eye placement, shape, stylization, and rendering treatment.",
+        ],
+        "eyeball_part": [
+            "Add one separate reusable Eyeball part.",
+            "It must be exactly one isolated spherical eyeball asset.",
+            "Do not include eyelids, eyelashes, skin, brow, socket, tear duct, face crop, head, or surrounding flesh.",
+        ],
+    }
+
+
+def _part_guidance_block_text(key):
+    labels = {
+        "base_face": "Auto Base Face",
+        "eyes_in_base": "Auto Eyes In Base",
+        "eyeball_part": "Auto Eyeball Part",
+    }
+    lines = _part_guidance_block_lines().get(key, [])
+    if not lines:
+        return ""
+    body = "\n".join(f"- {line}" for line in lines)
+    label = labels.get(key, key)
+    return f"[{label}]\n{body}\n[/{label}]"
+
+
+def _remove_part_guidance_block(text, key):
+    labels = {
+        "base_face": "Auto Base Face",
+        "eyes_in_base": "Auto Eyes In Base",
+        "eyeball_part": "Auto Eyeball Part",
+    }
+    label = re.escape(labels.get(key, key))
+    pattern = re.compile(rf"\n?\[{label}\]\n.*?\n\[/{label}\]\n?", re.DOTALL)
+    cleaned = pattern.sub("\n", text or "")
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _upsert_part_guidance_block(text, key, enabled):
+    cleaned = _remove_part_guidance_block(text, key)
+    block = _part_guidance_block_text(key) if enabled else ""
+    if not block:
+        return cleaned
+    if not cleaned:
+        return block
+    return f"{cleaned}\n\n{block}"
+
+
+def _strip_part_guidance_markers(text):
+    value = (text or "").strip()
+    value = re.sub(r"\n?\[Auto [^\]]+\]\n.*?\n\[/Auto [^\]]+\]\n?", "\n", value, flags=re.DOTALL)
+    value = re.sub(r"\n{3,}", "\n\n", value)
+    return value.strip()
+
+
+def _sync_part_option_guidance(state):
+    global PART_GUIDANCE_SYNC_GUARD
+    if PART_GUIDANCE_SYNC_GUARD:
+        return
+    PART_GUIDANCE_SYNC_GUARD = True
+    try:
+        if not bool(getattr(state, "part_base_include_face", False)):
+            try:
+                state.part_base_include_eyes = False
+            except Exception:
+                pass
+        guidance = getattr(state, "part_extraction_guidance", "") or ""
+        guidance = _upsert_part_guidance_block(guidance, "base_face", bool(getattr(state, "part_base_include_face", False)))
+        guidance = _upsert_part_guidance_block(
+            guidance,
+            "eyes_in_base",
+            bool(getattr(state, "part_base_include_face", False)) and bool(getattr(state, "part_base_include_eyes", False)),
+        )
+        guidance = _upsert_part_guidance_block(guidance, "eyeball_part", bool(getattr(state, "part_include_eye_part", False)))
+        state.part_extraction_guidance = guidance
+    finally:
+        PART_GUIDANCE_SYNC_GUARD = False
+
+
+def _on_part_extraction_option_changed(self, context):
+    _sync_part_option_guidance(self)
+
+
+def _imagegen_managed_prompt_block_text(kind, preset):
+    labels = {
+        PROMPT_KIND_SUBJECT: "Auto Subject",
+        PROMPT_KIND_STYLE: "Auto Style",
+    }
+    prompt = (preset.get("prompt") or "").strip()
+    if not prompt or kind not in labels:
+        return ""
+    return f"[{labels[kind]}]\n{prompt}\n[/{labels[kind]}]"
+
+
+def _remove_imagegen_managed_prompt_block(text, kind):
+    labels = {
+        PROMPT_KIND_SUBJECT: "Auto Subject",
+        PROMPT_KIND_STYLE: "Auto Style",
+    }
+    label = re.escape(labels.get(kind, ""))
+    if not label:
+        return (text or "").strip()
+    pattern = re.compile(rf"\n?\[{label}\]\n.*?\n\[/{label}\]\n?", re.DOTALL)
+    cleaned = pattern.sub("\n", text or "")
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _strip_imagegen_prompt_markers(text):
+    value = (text or "").strip()
+    value = re.sub(r"\n?\[Auto (?:Subject|Style)\]\n.*?\n\[/Auto (?:Subject|Style)\]\n?", "\n", value, flags=re.DOTALL)
+    value = re.sub(r"\n{3,}", "\n\n", value)
+    return value.strip()
+
+
+def _sync_imagegen_managed_prompt_blocks(state):
+    global IMAGEGEN_PROMPT_SYNC_GUARD
+    if IMAGEGEN_PROMPT_SYNC_GUARD:
+        return
+    IMAGEGEN_PROMPT_SYNC_GUARD = True
+    try:
+        current_prompt = getattr(state, "imagegen_prompt", "") or ""
+        body = _remove_imagegen_managed_prompt_block(current_prompt, PROMPT_KIND_SUBJECT)
+        body = _remove_imagegen_managed_prompt_block(body, PROMPT_KIND_STYLE)
+
+        blocks = []
+        subject_key = _sync_imagegen_prompt_preset(state, "imagegen_prompt_preset", PROMPT_KIND_SUBJECT)
+        style_key = _sync_imagegen_style_preset(state)
+
+        subject = _imagegen_prompt_preset_data(subject_key, PROMPT_KIND_SUBJECT)
+        subject_block = _imagegen_managed_prompt_block_text(PROMPT_KIND_SUBJECT, subject)
+        if subject_block:
+            blocks.append(subject_block)
+
+        style = _imagegen_prompt_preset_data(style_key, PROMPT_KIND_STYLE)
+        style_block = _imagegen_managed_prompt_block_text(PROMPT_KIND_STYLE, style)
+        if style_block:
+            blocks.append(style_block)
+
+        new_prompt = "\n\n".join(blocks + ([body.strip()] if body.strip() else []))
+        if (current_prompt or "").strip() != (new_prompt or "").strip():
+            _set_imagegen_prompt_value(state, "prompt", new_prompt)
+    finally:
+        IMAGEGEN_PROMPT_SYNC_GUARD = False
+
+
+def _clear_imagegen_managed_prompt_blocks(state, *, reset_dropdowns=False):
+    prompt = getattr(state, "imagegen_prompt", "") or ""
+    prompt = _remove_imagegen_managed_prompt_block(prompt, PROMPT_KIND_SUBJECT)
+    prompt = _remove_imagegen_managed_prompt_block(prompt, PROMPT_KIND_STYLE)
+    _set_imagegen_prompt_value(state, "prompt", prompt)
+    if reset_dropdowns:
+        try:
+            state.imagegen_prompt_preset = NO_PROMPT_PRESET_KEY
+            state.imagegen_style_preset = NO_PROMPT_PRESET_KEY
+        except Exception:
+            pass
+
+
+def _reset_imagegen_prompt_builder_state(state):
+    _clear_imagegen_managed_prompt_blocks(state, reset_dropdowns=True)
+
+
+def _on_imagegen_managed_prompt_changed(self, context):
+    _sync_imagegen_managed_prompt_blocks(self)
+
+
+def _load_selected_saved_prompt_into_prompt(state):
+    key = _sync_imagegen_prompt_preset(state, "imagegen_saved_prompt_preset", PROMPT_KIND_SAVED)
+    preset = _imagegen_prompt_preset_data(key, PROMPT_KIND_SAVED)
+    if not preset.get("prompt"):
+        return False
+    _reset_imagegen_prompt_builder_state(state)
+    _set_imagegen_prompt_value(state, "prompt", preset["prompt"])
+    return True
+
+
+def _on_imagegen_saved_prompt_changed(self, context):
+    if _load_selected_saved_prompt_into_prompt(self):
+        self.imagegen_status_text = f"Loaded saved prompt: {(_imagegen_prompt_preset_data(self.imagegen_saved_prompt_preset, PROMPT_KIND_SAVED).get('label') or 'Saved Prompt')}"
+
+
 def _imagegen_preset_dir():
     return bpy.utils.user_resource(
         "CONFIG",
@@ -935,7 +1226,37 @@ def _imagegen_preset_slug(name):
 
 
 def _imagegen_preset_file(key):
-    return os.path.join(_imagegen_preset_dir(), f"{_imagegen_preset_slug(key)}.json")
+    filename_key = re.sub(r"[^a-z0-9_]+", "_", (key or "").strip().lower()).strip("_")
+    return os.path.join(_imagegen_preset_dir(), f"{filename_key or 'prompt_preset'}.json")
+
+
+def _prompt_preset_key(kind, key):
+    key = _imagegen_preset_slug(key)
+    return f"{kind}__{key}"
+
+
+def _split_prompt_preset_key(value):
+    raw = (value or "").strip()
+    for kind in (PROMPT_KIND_SUBJECT, PROMPT_KIND_STYLE, PROMPT_KIND_SAVED):
+        prefix = f"{kind}__"
+        if raw.startswith(prefix):
+            return kind, raw[len(prefix):]
+    return PROMPT_KIND_SUBJECT, raw
+
+
+def _prompt_preset_text(data):
+    return str(data.get("prompt") or data.get("style") or data.get("text") or "").strip()
+
+
+def _prompt_preset_payload(name, kind, prompt, description=""):
+    payload = {
+        "name": name,
+        "kind": kind,
+        "prompt": prompt,
+    }
+    if description:
+        payload["description"] = description
+    return payload
 
 
 def _seed_imagegen_prompt_presets():
@@ -944,16 +1265,29 @@ def _seed_imagegen_prompt_presets():
     except Exception:
         return
     marker = os.path.join(preset_dir, ".defaults_seeded")
-    if os.path.exists(marker):
-        return
     for key, data in IMAGEGEN_PROMPT_PRESETS.items():
-        path = _imagegen_preset_file(key)
+        path = _imagegen_preset_file(_prompt_preset_key(PROMPT_KIND_SUBJECT, key))
         if os.path.exists(path):
             continue
-        payload = {
-            "name": data["label"],
-            "prompt": data["prompt"],
-        }
+        payload = _prompt_preset_payload(
+            data["label"],
+            PROMPT_KIND_SUBJECT,
+            data["prompt"],
+            data.get("description", ""),
+        )
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.write("\n")
+    for key, data in IMAGEGEN_STYLE_PRESETS.items():
+        path = _imagegen_preset_file(_prompt_preset_key(PROMPT_KIND_STYLE, key))
+        if os.path.exists(path):
+            continue
+        payload = _prompt_preset_payload(
+            data["label"],
+            PROMPT_KIND_STYLE,
+            data["style"],
+            data.get("description", ""),
+        )
         with open(path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2)
             handle.write("\n")
@@ -965,35 +1299,51 @@ def _load_imagegen_prompt_presets():
     preset_dir = _imagegen_preset_dir()
 
     def _load():
-        presets = {
-            key: {
+        presets = {}
+        for key, data in IMAGEGEN_PROMPT_PRESETS.items():
+            preset_key = _prompt_preset_key(PROMPT_KIND_SUBJECT, key)
+            presets[preset_key] = {
                 "label": data["label"],
                 "description": data["description"],
+                "kind": PROMPT_KIND_SUBJECT,
                 "prompt": data["prompt"],
             }
-            for key, data in IMAGEGEN_PROMPT_PRESETS.items()
-        }
+        for key, data in IMAGEGEN_STYLE_PRESETS.items():
+            preset_key = _prompt_preset_key(PROMPT_KIND_STYLE, key)
+            presets[preset_key] = {
+                "label": data["label"],
+                "description": data["description"],
+                "kind": PROMPT_KIND_STYLE,
+                "prompt": data["style"],
+            }
         try:
             _seed_imagegen_prompt_presets()
             for filename in sorted(os.listdir(preset_dir)):
                 if not filename.lower().endswith(".json"):
                     continue
-                key = os.path.splitext(filename)[0]
-                if key in IMAGEGEN_PROMPT_PRESETS:
-                    continue
+                file_key = os.path.splitext(filename)[0]
                 path = os.path.join(preset_dir, filename)
                 try:
                     with open(path, "r", encoding="utf-8") as handle:
                         data = json.load(handle)
                 except Exception:
                     continue
-                name = str(data.get("name") or key.replace("_", " ").title()).strip()
-                prompt = str(data.get("prompt") or "").strip()
+                raw_kind = str(data.get("kind") or data.get("type") or "").strip().lower()
+                inferred_kind, inferred_key = _split_prompt_preset_key(file_key)
+                kind = raw_kind if raw_kind in PROMPT_KIND_LABELS else inferred_kind
+                if raw_kind in PROMPT_KIND_LABELS:
+                    old_prefix = f"{raw_kind}_"
+                    if inferred_key.startswith(old_prefix):
+                        inferred_key = inferred_key[len(old_prefix):]
+                name = str(data.get("name") or data.get("label") or inferred_key.replace("_", " ").title()).strip()
+                prompt = _prompt_preset_text(data)
                 if not prompt:
                     continue
-                presets[key] = {
+                preset_key = _prompt_preset_key(kind, inferred_key or name)
+                presets[preset_key] = {
                     "label": name,
-                    "description": f"Prompt preset file: {filename}",
+                    "description": str(data.get("description") or f"{PROMPT_KIND_LABELS.get(kind, 'Prompt')} preset file: {filename}").strip(),
+                    "kind": kind,
                     "prompt": prompt,
                 }
         except Exception:
@@ -1003,49 +1353,80 @@ def _load_imagegen_prompt_presets():
     return _transient_cached("imagegen_prompt_presets", preset_dir, PRESET_CACHE_TTL_SECONDS, _load)
 
 
-def _imagegen_prompt_preset_data(preset_key):
+def _imagegen_prompt_presets_by_kind(kind):
     presets = _load_imagegen_prompt_presets()
+    return {
+        key: data
+        for key, data in presets.items()
+        if data.get("kind") == kind
+    }
+
+
+def _imagegen_prompt_preset_data(preset_key, kind=PROMPT_KIND_SUBJECT):
+    presets = _imagegen_prompt_presets_by_kind(kind)
     resolved_key = (preset_key or "").strip()
-    if resolved_key in presets:
+    if resolved_key == NO_PROMPT_PRESET_KEY:
+        return {"label": "None", "prompt": "", "kind": kind}
+    if resolved_key and resolved_key != NO_PROMPT_PRESET_KEY and resolved_key in presets:
         return presets[resolved_key]
-    if DEFAULT_IMAGEGEN_PROMPT_PRESET in presets:
-        return presets[DEFAULT_IMAGEGEN_PROMPT_PRESET]
+    default_key = _prompt_preset_key(PROMPT_KIND_SUBJECT, DEFAULT_IMAGEGEN_PROMPT_PRESET)
+    if kind == PROMPT_KIND_SUBJECT and default_key in presets:
+        return presets[default_key]
     return next(iter(presets.values()), {"label": "No Preset", "prompt": ""})
 
 
-def _imagegen_prompt_preset_items(self, context):
-    presets = _load_imagegen_prompt_presets()
+def _imagegen_prompt_preset_items_for_kind(kind, include_none=False):
+    presets = _imagegen_prompt_presets_by_kind(kind)
+    items = []
+    if include_none:
+        items.append((NO_PROMPT_PRESET_KEY, "None", f"Do not insert a {PROMPT_KIND_LABELS.get(kind, 'prompt').lower()} prompt"))
     if not presets:
-        return (("__none__", "No Presets", "No prompt presets found"),)
-    return tuple((key, data["label"], data["description"]) for key, data in presets.items())
+        return tuple(items or [(NO_PROMPT_PRESET_KEY, "No Presets", "No prompt presets found")])
+    items.extend((key, data["label"], data["description"]) for key, data in presets.items())
+    return tuple(items)
 
 
-def _resolve_imagegen_prompt_preset_key(preset_key):
-    presets = _load_imagegen_prompt_presets()
+def _imagegen_subject_preset_items(self, context):
+    return _imagegen_prompt_preset_items_for_kind(PROMPT_KIND_SUBJECT, include_none=True)
+
+
+def _imagegen_style_preset_items(self, context):
+    return _imagegen_prompt_preset_items_for_kind(PROMPT_KIND_STYLE, include_none=True)
+
+
+def _imagegen_saved_prompt_items(self, context):
+    return _imagegen_prompt_preset_items_for_kind(PROMPT_KIND_SAVED, include_none=True)
+
+
+def _imagegen_prompt_preset_items(self, context):
+    return _imagegen_subject_preset_items(self, context)
+
+
+def _resolve_imagegen_prompt_preset_key(preset_key, kind=PROMPT_KIND_SUBJECT):
+    presets = _imagegen_prompt_presets_by_kind(kind)
     resolved_key = (preset_key or "").strip()
+    if resolved_key == NO_PROMPT_PRESET_KEY:
+        return NO_PROMPT_PRESET_KEY
     if resolved_key in presets:
         return resolved_key
-    if DEFAULT_IMAGEGEN_PROMPT_PRESET in presets:
-        return DEFAULT_IMAGEGEN_PROMPT_PRESET
-    return next(iter(presets.keys()), "__none__")
+    default_key = _prompt_preset_key(PROMPT_KIND_SUBJECT, DEFAULT_IMAGEGEN_PROMPT_PRESET)
+    if kind == PROMPT_KIND_SUBJECT and default_key in presets:
+        return default_key
+    return NO_PROMPT_PRESET_KEY if kind != PROMPT_KIND_SUBJECT else next(iter(presets.keys()), NO_PROMPT_PRESET_KEY)
 
 
-def _sync_imagegen_prompt_preset(state):
-    key = _resolve_imagegen_prompt_preset_key(getattr(state, "imagegen_prompt_preset", ""))
+def _sync_imagegen_prompt_preset(state, attr_name="imagegen_prompt_preset", kind=PROMPT_KIND_SUBJECT):
+    key = _resolve_imagegen_prompt_preset_key(getattr(state, attr_name, ""), kind)
     try:
-        if getattr(state, "imagegen_prompt_preset", "") != key:
-            state.imagegen_prompt_preset = key
+        if getattr(state, attr_name, "") != key:
+            setattr(state, attr_name, key)
     except Exception:
         pass
     return key
 
 
 def _imagegen_style_preset_dir():
-    return bpy.utils.user_resource(
-        "CONFIG",
-        path=os.path.join("nymphs", "image_style_presets"),
-        create=True,
-    )
+    return _imagegen_preset_dir()
 
 
 def _imagegen_style_preset_slug(name):
@@ -1054,125 +1435,53 @@ def _imagegen_style_preset_slug(name):
 
 
 def _imagegen_style_preset_file(key):
-    return os.path.join(_imagegen_style_preset_dir(), f"{_imagegen_style_preset_slug(key)}.json")
+    return _imagegen_preset_file(_prompt_preset_key(PROMPT_KIND_STYLE, key))
 
 
 def _seed_imagegen_style_presets():
-    try:
-        preset_dir = _imagegen_style_preset_dir()
-    except Exception:
-        return
-    marker = os.path.join(preset_dir, ".defaults_seeded")
-    if os.path.exists(marker):
-        return
-    for key, data in IMAGEGEN_STYLE_PRESETS.items():
-        path = _imagegen_style_preset_file(key)
-        if os.path.exists(path):
-            continue
-        payload = {
-            "name": data["label"],
-            "description": data["description"],
-            "style": data["style"],
-        }
-        with open(path, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2)
-            handle.write("\n")
-    with open(marker, "w", encoding="utf-8") as handle:
-        handle.write("Defaults seeded.\n")
+    _seed_imagegen_prompt_presets()
 
 
 def _load_imagegen_style_presets():
-    preset_dir = _imagegen_style_preset_dir()
-
-    def _load():
-        presets = {
-            key: {
-                "label": data["label"],
-                "description": data["description"],
-                "style": data["style"],
-            }
-            for key, data in IMAGEGEN_STYLE_PRESETS.items()
+    return {
+        key: {
+            "label": data["label"],
+            "description": data["description"],
+            "style": data["prompt"],
         }
-        try:
-            _seed_imagegen_style_presets()
-            for filename in sorted(os.listdir(preset_dir)):
-                if not filename.lower().endswith(".json"):
-                    continue
-                key = os.path.splitext(filename)[0]
-                if key in IMAGEGEN_STYLE_PRESETS:
-                    continue
-                path = os.path.join(preset_dir, filename)
-                try:
-                    with open(path, "r", encoding="utf-8") as handle:
-                        data = json.load(handle)
-                except Exception:
-                    continue
-                name = str(data.get("name") or key.replace("_", " ").title()).strip()
-                style = str(data.get("style") or data.get("prompt") or "").strip()
-                if not style:
-                    continue
-                presets[key] = {
-                    "label": name,
-                    "description": str(data.get("description") or f"Style preset file: {filename}").strip(),
-                    "style": style,
-                }
-        except Exception:
-            pass
-        return presets
-
-    return _transient_cached("imagegen_style_presets", preset_dir, PRESET_CACHE_TTL_SECONDS, _load)
+        for key, data in _imagegen_prompt_presets_by_kind(PROMPT_KIND_STYLE).items()
+    }
 
 
 def _imagegen_style_preset_data(preset_key):
-    presets = _load_imagegen_style_presets()
-    resolved_key = (preset_key or "").strip()
-    if resolved_key in presets:
-        return presets[resolved_key]
+    data = _imagegen_prompt_preset_data(preset_key, PROMPT_KIND_STYLE)
+    if data.get("prompt"):
+        return {
+            "label": data.get("label", "Style"),
+            "description": data.get("description", ""),
+            "style": data.get("prompt", ""),
+        }
     return {"label": "No Style", "style": ""}
 
 
 def _imagegen_style_preset_items(self, context):
-    presets = _load_imagegen_style_presets()
-    items = [(DEFAULT_IMAGEGEN_STYLE_PRESET, "No Style", "Don't inject a reusable style fragment")]
-    items.extend((key, data["label"], data["description"]) for key, data in presets.items())
-    return tuple(items)
+    return _imagegen_prompt_preset_items_for_kind(PROMPT_KIND_STYLE, include_none=True)
 
 
 def _resolve_imagegen_style_preset_key(preset_key):
-    presets = _load_imagegen_style_presets()
-    resolved_key = (preset_key or "").strip()
-    if resolved_key == DEFAULT_IMAGEGEN_STYLE_PRESET:
-        return DEFAULT_IMAGEGEN_STYLE_PRESET
-    if resolved_key in presets:
-        return resolved_key
-    return DEFAULT_IMAGEGEN_STYLE_PRESET
+    return _resolve_imagegen_prompt_preset_key(preset_key, PROMPT_KIND_STYLE)
 
 
 def _sync_imagegen_style_preset(state):
-    key = _resolve_imagegen_style_preset_key(getattr(state, "imagegen_style_preset", ""))
-    try:
-        if getattr(state, "imagegen_style_preset", "") != key:
-            state.imagegen_style_preset = key
-    except Exception:
-        pass
-    return key
+    return _sync_imagegen_prompt_preset(state, "imagegen_style_preset", PROMPT_KIND_STYLE)
 
 
 def _compose_imagegen_prompt(prompt_text, style_text):
-    prompt = (prompt_text or "").strip()
-    style = (style_text or "").strip()
-    if not style:
-        return prompt
-    style_sentence = f"Visual style: {style.rstrip().rstrip('.')}. "
-    marker = "Character description:"
-    if marker in prompt:
-        before, after = prompt.rsplit(marker, 1)
-        return f"{before.rstrip()} {style_sentence}{marker}{after}"
-    return f"{prompt.rstrip()} {style_sentence}".strip()
+    return _strip_imagegen_prompt_markers(prompt_text or "")
 
 
 def _resolved_imagegen_prompt(state):
-    return _compose_imagegen_prompt(getattr(state, "imagegen_prompt", ""), getattr(state, "imagegen_style", ""))
+    return _strip_imagegen_prompt_markers(getattr(state, "imagegen_prompt", "") or "")
 
 
 def _imagegen_settings_preset_dir():
@@ -1473,14 +1782,20 @@ def _sync_trellis_shape_preset(state):
 
 
 def _imagegen_text_field_name(target):
+    if target == "guidance":
+        return "part_extraction_guidance"
     return "imagegen_prompt"
 
 
 def _imagegen_text_name_field(target):
+    if target == "guidance":
+        return "part_extraction_guidance_text_name"
     return "imagegen_prompt_text_name"
 
 
 def _default_imagegen_text_name(target):
+    if target == "guidance":
+        return DEFAULT_PART_EXTRACTION_GUIDANCE_TEXT_NAME
     return DEFAULT_IMAGEGEN_PROMPT_TEXT_NAME
 
 
@@ -1489,6 +1804,38 @@ def _linked_imagegen_text(state, target):
     if stored_name:
         return bpy.data.texts.get(stored_name)
     return None
+
+
+def _sync_imagegen_text_block(state, target, value):
+    text = _linked_imagegen_text(state, target)
+    if text is None:
+        return False
+    text.clear()
+    if value:
+        text.write(value)
+    return True
+
+
+def _set_imagegen_prompt_value(state, target, value, *, sync_text=True):
+    value = value or ""
+    setattr(state, _imagegen_text_field_name(target), value)
+    if sync_text:
+        _sync_imagegen_text_block(state, target, value)
+
+
+def _insert_imagegen_prompt_text(state, value):
+    insert_text = (value or "").strip()
+    if not insert_text:
+        return False
+    current = (getattr(state, "imagegen_prompt", "") or "").strip()
+    prompt = insert_text if not current else f"{current}\n\n{insert_text}"
+    _set_imagegen_prompt_value(state, "prompt", prompt)
+    return True
+
+
+def _clear_prompt_preset_cache():
+    with CACHE_LOCK:
+        TRANSIENT_CACHE.pop("imagegen_prompt_presets", None)
 
 
 def _ensure_imagegen_text(state, target):
@@ -1502,7 +1849,8 @@ def _ensure_imagegen_text(state, target):
             created = True
         setattr(state, _imagegen_text_name_field(target), text.name)
     current_value = getattr(state, _imagegen_text_field_name(target), "") or ""
-    if created or not text.as_string().strip():
+    text_value = _text_to_prompt_value(text)
+    if created or not text_value.strip() or text_value != current_value:
         text.clear()
         if current_value:
             text.write(current_value)
@@ -1517,7 +1865,7 @@ def _pull_imagegen_text_from_block(state, target):
     text = _linked_imagegen_text(state, target)
     if text is None:
         return False
-    setattr(state, _imagegen_text_field_name(target), _text_to_prompt_value(text))
+    _set_imagegen_prompt_value(state, target, _text_to_prompt_value(text), sync_text=False)
     return True
 
 
@@ -1809,6 +2157,7 @@ def _gemini_guide_image_data_url(raw_path):
 
 
 def _gemini_api_key(state):
+    _ensure_openrouter_api_key_loaded(state)
     key = (getattr(state, "openrouter_api_key", "") or "").strip()
     if key:
         return key
@@ -1835,6 +2184,132 @@ def _gemini_snapshot(state):
     if guide_image_path:
         snapshot["guide_image_path"], snapshot["guide_image_data_url"] = _gemini_guide_image_data_url(guide_image_path)
     return snapshot
+
+
+def _part_planner_model_id(state_or_snapshot):
+    if isinstance(state_or_snapshot, dict):
+        raw_value = (state_or_snapshot.get("part_planner_model") or "").strip()
+    else:
+        raw_value = (getattr(state_or_snapshot, "part_planner_model", "") or "").strip()
+    return GEMINI_PLANNER_MODEL_IDS.get(raw_value, raw_value or GEMINI_PLANNER_MODEL_IDS["gemini_2_5_flash"])
+
+
+def _part_planner_model_label(model_id):
+    if model_id == "google/gemini-3.1-pro-preview":
+        return "Gemini 3.1 Pro"
+    if model_id == "google/gemini-2.5-flash":
+        return "Gemini 2.5 Flash"
+    return _path_leaf(model_id) or model_id
+
+
+def _part_extraction_snapshot(state, source_image_path):
+    snapshot = _gemini_snapshot(state)
+    guide_path, guide_data_url = _gemini_guide_image_data_url(source_image_path)
+    snapshot["guide_image_path"] = guide_path
+    snapshot["guide_image_data_url"] = guide_data_url
+    snapshot["part_planner_model"] = _part_planner_model_id(state)
+    snapshot["part_planner_label"] = _part_planner_model_label(snapshot["part_planner_model"])
+    snapshot["part_extraction_guidance"] = _strip_part_guidance_markers(
+        (getattr(state, "part_extraction_guidance", "") or "").strip()
+    )
+    if bool(getattr(state, "part_extraction_style_lock", True)):
+        style_preset = _imagegen_style_preset_data(_sync_imagegen_style_preset(state))
+        snapshot["part_extraction_style"] = (style_preset.get("style") or "").strip()
+        snapshot["part_extraction_style_label"] = style_preset.get("label", "No Style")
+    else:
+        snapshot["part_extraction_style"] = ""
+        snapshot["part_extraction_style_label"] = "No Style"
+    snapshot["part_extraction_max_parts"] = max(1, int(getattr(state, "part_extraction_max_parts", 8)))
+    snapshot["part_base_include_face"] = bool(getattr(state, "part_base_include_face", False))
+    snapshot["part_base_include_eyes"] = bool(getattr(state, "part_base_include_face", False)) and bool(
+        getattr(state, "part_base_include_eyes", False)
+    )
+    snapshot["part_include_eye_part"] = bool(getattr(state, "part_include_eye_part", False))
+    return snapshot
+
+
+def _openrouter_text_from_image(api_key, model_id, image_data_url, prompt, *, timeout=1800):
+    prompt = (prompt or "").strip()
+    if not prompt:
+        raise RuntimeError("Enter a planning prompt first.")
+    payload = {
+        "model": model_id,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": prompt,
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": image_data_url,
+                        },
+                    },
+                ],
+            }
+        ],
+        "response_format": {"type": "json_object"},
+        "temperature": 0.1,
+        "stream": False,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+    }
+    try:
+        _, _, body = _http_call(
+            "POST",
+            f"{OPENROUTER_API_ROOT}/chat/completions",
+            payload=payload,
+            headers=headers,
+            timeout=timeout,
+        )
+    except RuntimeError as exc:
+        if "response_format" not in str(exc).lower():
+            raise
+        payload.pop("response_format", None)
+        _, _, body = _http_call(
+            "POST",
+            f"{OPENROUTER_API_ROOT}/chat/completions",
+            payload=payload,
+            headers=headers,
+            timeout=timeout,
+        )
+    try:
+        detail = json.loads(body.decode("utf-8"))
+    except Exception as exc:
+        raise RuntimeError("OpenRouter returned invalid JSON.") from exc
+
+    text_parts = []
+    finish_reasons = []
+    native_finish_reasons = []
+    for choice in detail.get("choices", []) or []:
+        finish_reason = (choice.get("finish_reason") or "").strip()
+        if finish_reason:
+            finish_reasons.append(finish_reason)
+        native_finish_reason = (choice.get("native_finish_reason") or "").strip()
+        if native_finish_reason:
+            native_finish_reasons.append(native_finish_reason)
+        message = choice.get("message") or {}
+        content = message.get("content")
+        if isinstance(content, str):
+            text_parts.append(content.strip())
+        elif isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    text_parts.append(str(item.get("text") or "").strip())
+
+    text = "\n".join(part for part in text_parts if part).strip()
+    if not text:
+        message = "Planner did not return text."
+        if native_finish_reasons:
+            message += f" Provider finish reason: {', '.join(dict.fromkeys(native_finish_reasons))}."
+        elif finish_reasons:
+            message += f" Finish reason: {', '.join(dict.fromkeys(finish_reasons))}."
+        raise RuntimeError(message)
+    return text, detail
 
 
 def _gemini_image_suffix(mime_type):
@@ -1865,21 +2340,21 @@ def _character_part_breakout_variant_prompts(base_prompt, variant_count):
                 "Request target: render only the neutral anatomy base body in a clean A-pose or T-pose for a game asset base mesh reference. "
                 "Use simplified non-explicit anatomy. "
                 "Exactly one centered subject only. "
-                "No second character, no clothing, no accessories, no weapons, no props, no staff, no separate items, no side-by-side layout."
+                "Critical exclusions: no second character, no clothing, no accessories, no weapons, no props, no staff, no separate items, and no side-by-side layout."
             )
         elif index == 1:
             instructions.append(
                 "Request target: render only the hair or hairstyle asset from the character design. "
                 "Exactly one centered subject only. "
-                "No head, no face, no body, no mannequin, no clothing, no accessories, no second item, no side-by-side layout."
+                "Critical exclusions: no head, no face, no body, no mannequin, no clothing, no accessories, no second item, and no side-by-side layout."
             )
         else:
             instructions.append(
                 "Request target: render only one different remaining item from the character design that has "
                 "not been depicted yet. Prioritize clothing, armor pieces, accessories, weapons, and carried props. "
                 "Exactly one centered subject only. "
-                "Do not render the body. Do not render hair unless hair is the chosen target. "
-                "Do not include a full character, no second item, no side-by-side layout."
+                "Critical exclusions: do not render the body. Do not render hair unless hair is the chosen target. "
+                "Do not include a full character, a second item, or a side-by-side layout."
             )
     return [f"{base_prompt.rstrip()}\n\n{instruction}" for instruction in instructions]
 
@@ -1892,8 +2367,510 @@ def _character_part_breakout_auto_prompt(base_prompt):
         "Generate as many images as needed to cover the anatomy base body, hair, and each major wearable or carried item. "
         "Start with the anatomy base body, then hair, then the remaining items. "
         "Exactly one centered subject per image. "
-        "No side-by-side layouts, no combined items, no full character plus prop in the same image."
+        "Critical exclusions: no side-by-side layouts, no combined items, and no full character plus prop in the same image."
     )
+
+
+def _part_extraction_planning_prompt(
+    guidance,
+    *,
+    base_include_face=False,
+    base_include_eyes=False,
+    include_eye_part=False,
+):
+    guidance = (guidance or DEFAULT_PART_EXTRACTION_GUIDANCE).strip()
+    base_face_rule = (
+        "- For anatomy_base, keep facial features on the base body and match the source character's face structure.\n"
+        if base_include_face
+        else "- For anatomy_base, keep the head feature-neutral with no finished face details, eyes, nose, mouth, or brows.\n"
+    )
+    base_eyes_rule = ""
+    if base_include_face and base_include_eyes:
+        base_eyes_rule = (
+            "- For anatomy_base, include finished eyes on the base body and match their placement, shape, and stylization to the source.\n"
+        )
+    elif base_include_face:
+        base_eyes_rule = (
+            "- For anatomy_base, keep the face but do not include finished eyes, eyeballs, pupils, lashes, or painted eye detail.\n"
+        )
+    eye_part_rule = (
+        "- Include one separate reusable Eyeball part with category face_feature. It must be exactly one isolated spherical eyeball asset only: sclera, iris, pupil, cornea highlight, and painted surface detail. Do not include eyelids, eyelashes, skin, brow, eye socket, tear duct, face crop, head, or surrounding flesh.\n"
+        if include_eye_part
+        else ""
+    )
+    return (
+        "Look at the provided master character reference image and plan separate asset extractions for a 3D game asset workflow.\n\n"
+        "Return JSON only. Do not include markdown fences or commentary.\n\n"
+        "Schema:\n"
+        "{\n"
+        "  \"parts\": [\n"
+        "    {\n"
+        "      \"id\": \"short_stable_slug\",\n"
+        "      \"display_name\": \"Human readable part name\",\n"
+        "      \"category\": \"anatomy_base | hair | clothing | armor | accessory | weapon | prop | face_feature\",\n"
+        "      \"priority\": 1,\n"
+        "      \"normalized_bbox\": [0.0, 0.0, 1.0, 1.0],\n"
+        "      \"extraction_prompt\": \"Specific instruction for isolating only this part from the master reference image\"\n"
+        "    }\n"
+        "  ]\n"
+        "}\n\n"
+        "Planning rules:\n"
+        "- Include one anatomy_base part first when a body/base mesh reference is visible or inferable.\n"
+        "- For anatomy_base, the extraction_prompt must ask for the body/base mesh only, not a dressed character.\n"
+        "- For anatomy_base, include body-type hints in the extraction_prompt, such as short, squat, stocky, stout, bulky, tiny, chibi, elderly, broad, or slim when visible or inferable from the silhouette.\n"
+        "- For anatomy_base, explicitly remove all hair, beard, cloak, robe, hood, hat, tunic, boots, belts, weapons, props, accessories, fabric, and costume details.\n"
+        "- For anatomy_base, request a smooth non-explicit base mesh body reference with no explicit sexual detail and no censor bars, stickers, blur, fabric panels, or added coverings.\n"
+        f"{base_face_rule}"
+        f"{base_eyes_rule}"
+        "- Do not create separate face-detail parts such as nose, mouth, cheeks, ears, brows, or generic face-detail sheets.\n"
+        "- Facial structure belongs on anatomy_base, not as a separate extracted part.\n"
+        "- Include hair and facial hair as their own separate part, never attached to clothing.\n"
+        "- Include each major garment, armor piece, weapon, carried prop, pouch, belt, or accessory that would matter for 3D asset creation.\n"
+        f"{eye_part_rule}"
+        "- Do not include scenery, ground shadows, background decorations, labels, or duplicate variants.\n"
+        "- Keep the list practical and cost-aware: prefer the most important 4 to 8 parts.\n"
+        "- Use normalized_bbox values in x_min, y_min, x_max, y_max order, from 0 to 1, estimating the source-image location.\n"
+        "- Each extraction_prompt must ask for exactly one isolated target item and must explicitly remove unrelated body parts, heads, mannequins, labels, extra objects, and background elements.\n\n"
+        f"Global extraction guidance to incorporate: {guidance}\n\n"
+        "Critical output constraints:\n"
+        "- Output valid JSON only.\n"
+        "- No markdown fences, no prose, no explanations.\n"
+        "- No duplicate parts.\n"
+        "- No combined multi-item parts.\n"
+        "- Put the most important exclusions inside each extraction_prompt at the end."
+    )
+
+
+def _extract_json_payload(text):
+    raw = (text or "").strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE).strip()
+        raw = re.sub(r"\s*```$", "", raw).strip()
+    try:
+        return json.loads(raw)
+    except Exception:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start >= 0 and end > start:
+            return json.loads(raw[start:end + 1])
+        raise
+
+
+def _slugify_part_id(value, fallback):
+    slug = re.sub(r"[^a-z0-9]+", "_", (value or "").strip().lower()).strip("_")
+    return slug or fallback
+
+
+def _normalized_bbox(value):
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return []
+    normalized = []
+    for item in value:
+        try:
+            normalized.append(max(0.0, min(1.0, float(item))))
+        except Exception:
+            return []
+    return normalized
+
+
+def _normalize_part_plan(raw_plan, *, max_parts=8):
+    if not isinstance(raw_plan, dict):
+        raise RuntimeError("Planner JSON must be an object with a parts list.")
+    raw_parts = raw_plan.get("parts")
+    if not isinstance(raw_parts, list):
+        raise RuntimeError("Planner JSON did not contain a parts list.")
+
+    parts = []
+    seen = set()
+    for index, raw_part in enumerate(raw_parts, start=1):
+        if not isinstance(raw_part, dict):
+            continue
+        display_name = str(raw_part.get("display_name") or raw_part.get("name") or "").strip()
+        category = str(raw_part.get("category") or "part").strip().lower()
+        fallback_id = f"part_{index:02d}"
+        part_id = _slugify_part_id(raw_part.get("id") or display_name, fallback_id)
+        if part_id in seen:
+            part_id = f"{part_id}_{index:02d}"
+        seen.add(part_id)
+        if not display_name:
+            display_name = part_id.replace("_", " ").title()
+        extraction_prompt = str(raw_part.get("extraction_prompt") or raw_part.get("prompt") or "").strip()
+        if not extraction_prompt:
+            extraction_prompt = (
+                f"Extract only the {display_name}. Remove all unrelated body parts, heads, mannequins, "
+                "labels, extra objects, and background elements."
+            )
+        try:
+            priority = int(raw_part.get("priority") or index)
+        except Exception:
+            priority = index
+        parts.append(
+            {
+                "id": part_id,
+                "display_name": display_name,
+                "category": category,
+                "priority": priority,
+                "symmetry": bool(raw_part.get("symmetry", False)),
+                "normalized_bbox": _normalized_bbox(raw_part.get("normalized_bbox")),
+                "extraction_prompt": extraction_prompt,
+            }
+        )
+
+    if not parts:
+        raise RuntimeError("Planner did not identify any extractable parts.")
+
+    parts.sort(key=lambda item: (item.get("priority", 999), item.get("id", "")))
+    return {
+        "parts": parts[: max(1, int(max_parts or 8))],
+    }
+
+
+def _part_plan_from_json_text(plan_json):
+    try:
+        return _normalize_part_plan(json.loads(plan_json or "{}"), max_parts=999)
+    except Exception:
+        return {"parts": []}
+
+
+def _part_plan_summary(plan_json):
+    parts = _part_plan_from_json_text(plan_json).get("parts", [])
+    return [part.get("display_name") or part.get("id") or "Part" for part in parts]
+
+
+def _part_mentions_eye(part):
+    identifier = " ".join(
+        str(part.get(key) or "").strip().lower()
+        for key in ("id", "display_name", "category", "extraction_prompt")
+    )
+    return bool(re.search(r"\b(?:eye|eyes|eyeball|eyeballs|iris|pupil)\b", identifier))
+
+
+def _part_is_face_detail(part):
+    category = (part.get("category") or "").strip().lower()
+    identifier = " ".join(
+        str(part.get(key) or "").strip().lower()
+        for key in ("id", "display_name", "extraction_prompt")
+    )
+    if any(word in identifier for word in ("beard", "moustache", "mustache", "facial hair", "hair")):
+        return False
+    if category == "face_feature":
+        return True
+    return any(
+        word in identifier
+        for word in (
+            " face ",
+            "facial",
+            "face detail",
+            "facial detail",
+            "nose",
+            "mouth",
+            "lip",
+            "eyebrow",
+            "brow",
+            "ear",
+            "cheek",
+            "jaw",
+        )
+    )
+
+
+def _forced_anatomy_base_part_payload(*, priority=1):
+    return {
+        "id": "anatomy_base",
+        "display_name": "Anatomy Base",
+        "category": "anatomy_base",
+        "priority": int(priority or 1),
+        "symmetry": False,
+        "normalized_bbox": [],
+        "extraction_prompt": (
+            "Extract the anatomy base body only as a clean reusable base mesh reference. "
+            "Infer it from the source character's silhouette and costume volume. "
+            "Keep the source body type and proportions. "
+            "Remove all clothing, hair, beard, accessories, weapons, props, and costume remnants."
+        ),
+    }
+
+
+def _single_eye_part_payload(*, priority=2, normalized_bbox=None, symmetry=False):
+    return {
+        "id": "eyeball",
+        "display_name": "Eyeball",
+        "category": "face_feature",
+        "priority": int(priority or 2),
+        "symmetry": bool(symmetry),
+        "normalized_bbox": _normalized_bbox(normalized_bbox or []),
+        "extraction_prompt": (
+            "Create exactly one isolated spherical eyeball asset inferred from the source character. "
+            "Show only the eyeball itself: sclera, iris, pupil, cornea highlight, and subtle painted surface detail. "
+            "Match the source iris design, pupil treatment, sclera treatment, highlights, color, and rendering style. "
+            "Do not include eyelids, eyelashes, skin, brow, eye socket, tear duct, surrounding flesh, makeup, face crop, head, or any anatomical tissue outside the eyeball. "
+            "Center the single eyeball on a plain light background as a clean reusable 3D asset reference."
+        ),
+    }
+
+
+def _ensure_required_part_plan_entries(plan, snapshot):
+    parts = list((plan or {}).get("parts") or [])
+    parts = [part for part in parts if not _part_is_face_detail(part)]
+    anatomy_parts = [
+        part for part in parts
+        if (part.get("category") or "").strip().lower() == "anatomy_base"
+        or "anatomy" in " ".join(str(part.get(key) or "").lower() for key in ("id", "display_name"))
+        or "base body" in " ".join(str(part.get(key) or "").lower() for key in ("id", "display_name", "extraction_prompt"))
+    ]
+    if anatomy_parts:
+        best_base = min(anatomy_parts, key=lambda item: int(item.get("priority") or 999))
+        forced_base = _forced_anatomy_base_part_payload(priority=best_base.get("priority") or 1)
+        parts = [part for part in parts if part not in anatomy_parts]
+        parts.append(forced_base)
+    else:
+        parts.append(_forced_anatomy_base_part_payload(priority=1))
+
+    if snapshot.get("part_include_eye_part"):
+        eye_parts = [part for part in parts if _part_mentions_eye(part)]
+        preserved_eye = None
+        if eye_parts:
+            best_eye = min(eye_parts, key=lambda item: int(item.get("priority") or 999))
+            preserved_eye = _single_eye_part_payload(
+                priority=best_eye.get("priority") or 2,
+                normalized_bbox=best_eye.get("normalized_bbox") or [],
+                symmetry=best_eye.get("symmetry", False),
+            )
+            parts = [part for part in parts if not _part_mentions_eye(part)]
+        else:
+            insert_priority = 2 if any((part.get("category") or "") == "anatomy_base" for part in parts) else 1
+            preserved_eye = _single_eye_part_payload(priority=insert_priority)
+        parts.append(preserved_eye)
+    return _normalize_part_plan({"parts": parts}, max_parts=snapshot.get("part_extraction_max_parts", 8))
+
+
+def _sync_part_extraction_items_from_plan(state):
+    parts = _part_plan_from_json_text(getattr(state, "part_extraction_plan_json", "")).get("parts", [])
+    try:
+        state.part_extraction_parts.clear()
+        for part in parts:
+            item = state.part_extraction_parts.add()
+            item.selected = True
+            item.symmetry = bool(part.get("symmetry", False))
+            item.part_id = str(part.get("id") or "").strip()
+            item.display_name = str(part.get("display_name") or item.part_id or "Part").strip()
+            item.category = str(part.get("category") or "").strip()
+            item.extraction_prompt = str(part.get("extraction_prompt") or "").strip()
+            bbox = part.get("normalized_bbox") or []
+            item.normalized_bbox_json = json.dumps(bbox) if bbox else ""
+    except Exception:
+        pass
+
+
+def _clear_part_extraction_plan_state(state):
+    state.part_extraction_plan_json = ""
+    state.part_extraction_plan_path = ""
+    state.part_extraction_results_path = ""
+    state.part_extraction_parts.clear()
+
+
+def _set_part_extraction_source_image(state, source_image_path, status_text):
+    old_path = _resolve_file_path(getattr(state, "part_extraction_source_path", "") or "")
+    new_path = _resolve_file_path(source_image_path or "")
+    has_existing_plan = bool((getattr(state, "part_extraction_plan_json", "") or "").strip())
+    source_changed = bool(new_path and (old_path != new_path or (has_existing_plan and not old_path)))
+    state.part_extraction_source_path = new_path
+    state.image_path = new_path
+    if source_changed:
+        _clear_part_extraction_plan_state(state)
+        state.imagegen_status_text = f"{status_text} Cleared old part plan."
+    else:
+        state.imagegen_status_text = status_text
+
+
+def _part_extraction_parts_from_state(state):
+    collection = getattr(state, "part_extraction_parts", None)
+    if collection is None:
+        return []
+    if len(collection) == 0 and (getattr(state, "part_extraction_plan_json", "") or "").strip():
+        _sync_part_extraction_items_from_plan(state)
+    return list(collection)
+
+
+def _selected_part_plan_from_state(state):
+    all_items = _part_extraction_parts_from_state(state)
+    selected_parts = []
+    for index, item in enumerate(all_items, start=1):
+        if not bool(getattr(item, "selected", True)):
+            continue
+        bbox = []
+        bbox_json = (getattr(item, "normalized_bbox_json", "") or "").strip()
+        if bbox_json:
+            try:
+                bbox = _normalized_bbox(json.loads(bbox_json))
+            except Exception:
+                bbox = []
+        display_name = (getattr(item, "display_name", "") or getattr(item, "part_id", "") or f"Part {index}").strip()
+        selected_parts.append(
+            {
+                "id": (getattr(item, "part_id", "") or _slugify_part_id(display_name, f"part_{index:02d}")).strip(),
+                "display_name": display_name,
+                "category": (getattr(item, "category", "") or "part").strip(),
+                "priority": len(selected_parts) + 1,
+                "symmetry": bool(getattr(item, "symmetry", False)),
+                "normalized_bbox": bbox,
+                "extraction_prompt": (getattr(item, "extraction_prompt", "") or "").strip(),
+            }
+        )
+    return {"parts": selected_parts, "planned_count": len(all_items)}
+
+
+def _part_extraction_prompt(
+    part,
+    guidance,
+    style_text="",
+    style_label="",
+    *,
+    base_include_face=False,
+    base_include_eyes=False,
+):
+    display_name = part.get("display_name") or part.get("id") or "character part"
+    extraction_prompt = (part.get("extraction_prompt") or "").strip()
+    category = (part.get("category") or "").strip().lower()
+    guidance = (guidance or DEFAULT_PART_EXTRACTION_GUIDANCE).strip()
+    style_text = (style_text or "").strip()
+    style_label = (style_label or "").strip()
+    style_block = ""
+    if style_text:
+        style_block = (
+            "\n\nStyle lock:\n"
+            "The extracted part must match the master image's exact visual style. "
+            f"Selected style preset: {style_label or 'Custom Style'}. "
+            f"Apply this style strongly: {style_text.rstrip().rstrip('.')}. "
+            "This style instruction is more important than generic asset cleanup. "
+            "Do not change the medium, linework, paint handling, or rendering style while isolating the item."
+        )
+    bbox = part.get("normalized_bbox") or []
+    bbox_hint = ""
+    if bbox:
+        bbox_hint = f"\nEstimated source location normalized bbox: {bbox}."
+    body_type_block = ""
+    symmetry_block = ""
+    critical_exclusions = [
+        "Do not create a parts sheet, grid, lineup, collage, catalog page, or multi-item layout.",
+        "Do not include labels, text, scenery, shadows, or unrelated objects.",
+        "Do not reinterpret the item as a product render, 3D render, realistic render, or glossy studio object.",
+    ]
+    identifier = f"{part.get('id', '')} {display_name} {category}".lower()
+    if category == "anatomy_base" or "anatomy" in identifier or "base body" in identifier:
+        face_rule = (
+            "Keep the face on the base body and match the source character's facial structure."
+            if base_include_face
+            else "Keep the head feature-neutral with no eyes, nose, mouth, brows, beard detail, or finished facial features."
+        )
+        eyes_rule = ""
+        if base_include_face and base_include_eyes:
+            eyes_rule = " Include finished eyes on the base body and match their placement, shape, and stylization to the source."
+        elif base_include_face:
+            eyes_rule = (
+                " Keep the full face structure, nose, mouth, cheeks, jaw, and brow shape, but do not include finished eyes. "
+                "Leave the eye area blank, unrendered, or closed with no visible eyeballs, irises, pupils, sclera, lashes, or painted eye detail."
+            )
+        extraction_prompt = (
+            f"{extraction_prompt} "
+            "This is the body/base mesh target only. Remove every costume, garment, cloak, robe, hood, hat, boot, belt, prop, staff, hair, beard, vine, and accessory. "
+            "Output only the inferred smooth non-explicit body silhouette for the same character proportions. "
+            f"{face_rule}{eyes_rule}"
+        ).strip()
+        body_type_block = (
+            "\n\nAnatomy base rules:\n"
+            "The target is the base body only. Do not extract or redraw clothing. "
+            "Infer the base body from the master character's visible silhouette and costume volume. "
+            "Preserve the source character's body type, height impression, age impression, and stylized proportions. "
+            "If the source character appears short, squat, stout, round, bulky, elderly, chibi, or dwarf-like, the anatomy base must keep those proportions. "
+            "Do not output a generic slim young adult, fashion figure, athletic template, or unrelated anatomy chart. "
+            "Create a smooth, non-explicit, feature-neutral base mesh body reference suitable for sculpting and shape generation. "
+            "No cloak, robe, hood, hat, tunic, boots, belts, gloves, hair, beard, staff, bag, vines, accessories, props, labels, scenery, fabric panels, blur, censor bars, stickers, or added coverings. "
+            "Do not add underwear, shorts, modesty cloth, or costume remnants; use a simplified non-explicit surface with no explicit sexual detail. "
+            f"{face_rule}{eyes_rule}"
+        )
+        if base_include_face and not base_include_eyes:
+            critical_exclusions.extend(
+                [
+                    "For the anatomy base, do not show finished eyes.",
+                    "No eyeballs, irises, pupils, sclera, eyelashes, eyeliner, or painted eye detail.",
+                    "Do not turn the face into a blank mannequin head with no nose or mouth.",
+                ]
+            )
+        elif not base_include_face:
+            critical_exclusions.extend(
+                [
+                    "For the anatomy base, no finished face details.",
+                    "No eyes, nose, mouth, brows, beard detail, or portrait-style facial rendering.",
+                ]
+            )
+    if category in {"clothing", "armor"} or any(
+        word in identifier for word in ("boot", "glove", "sleeve", "cloak", "robe", "hood", "pauldron")
+    ):
+        critical_exclusions.append(
+            "Do not include a head, face, hair, full body, mannequin, or hands unless structurally necessary for readability."
+        )
+    if not _part_mentions_eye(part):
+        critical_exclusions.extend(
+            [
+                "Do not add isolated eyes or eyeballs.",
+                "Do not add floating facial parts.",
+            ]
+        )
+        if not (category == "anatomy_base" and base_include_face and base_include_eyes):
+            critical_exclusions.append(
+                "Do not include finished eyes unless this specific part explicitly requires them."
+            )
+    if category == "hair" or any(word in identifier for word in ("hair", "beard", "moustache", "mustache", "brow")):
+        critical_exclusions.extend(
+            [
+                "Do not return an eyeball, eye crop, or face crop.",
+                "Do not turn this request into a portrait or facial feature extraction.",
+            ]
+        )
+    if _part_mentions_eye(part):
+        extraction_prompt = (
+            "Create exactly one isolated spherical eyeball asset from the source character. "
+            "Show only the eyeball itself: sclera, iris, pupil, cornea highlight, and subtle painted surface detail. "
+            "Match the exact iris design, pupil treatment, sclera treatment, highlights, color, and rendering style from the source. "
+            "Center the single eyeball on a plain light background as a clean reusable 3D asset reference."
+        )
+        critical_exclusions.extend(
+            [
+                "Show one single spherical eyeball only.",
+                "Do not include both eyes.",
+                "Do not include eyelids, eyelashes, skin, brow, eye socket, tear duct, surrounding flesh, makeup, or any anatomical tissue outside the eyeball.",
+                "Do not include a full face, a full head, hair, brows, nose, cheeks, ears, or forehead.",
+                "Do not return an eye-region crop; return one clean isolated eyeball asset.",
+            ]
+        )
+    if bool(part.get("symmetry", False)):
+        symmetry_block = (
+            "\n\nSymmetry lock:\n"
+            "The output must be perfectly left-right symmetrical and front-readable for easy refinement. "
+            "Match silhouette, seams, trim, folds, color placement, wear, and detail density evenly on both sides. "
+            "Do not introduce asymmetrical damage, drift, missing details, uneven hems, or side-to-side design differences."
+        )
+        if category in {"clothing", "armor"} or any(
+            word in identifier for word in ("boot", "glove", "sleeve", "cloak", "robe", "hood", "pauldron")
+        ):
+            symmetry_block += " Treat this wearable as a symmetry-critical asset."
+    return (
+        "Using the provided master character reference image, create one clean isolated asset reference image.\n\n"
+        f"Target part: {display_name}\n\n"
+        f"Extraction instruction: {extraction_prompt}\n\n"
+        f"Global guidance: {guidance}{style_block}{body_type_block}{symmetry_block}{bbox_hint}\n\n"
+        "Output rules:\n"
+        "- Show exactly one centered target item.\n"
+        "- Preserve the original design language, media style, material details, color palette, and scale relationship from the reference.\n"
+        "- Keep the same lighting and media feel as the source image; use a simple plain background only to isolate the item.\n"
+        "\nCritical exclusions:\n- "
+        + "\n- ".join(critical_exclusions)
+    )
+
+
+def _parts_metadata_path(label):
+    return os.path.splitext(_imagegen_output_path(label, ".json"))[0] + ".json"
 
 
 def _decode_image_data_url(data_url):
@@ -1988,7 +2965,7 @@ def _gemini_request_image(snapshot, prompt, output_label):
 
     if not image_urls:
         reason = (detail.get("error") or {}).get("message", "")
-        message = "Nano did not return an image."
+        message = "Gemini Flash did not return an image."
         if reason:
             message += f" {reason}"
         if native_finish_reasons:
@@ -2501,7 +3478,7 @@ def _path_leaf(raw_path):
 def _current_image_backend_label(state):
     backend = (getattr(state, "imagegen_backend", "Z_IMAGE") or "Z_IMAGE").strip()
     if backend == "GEMINI":
-        return "Nano"
+        return "Gemini Flash"
     return SERVICE_LABELS["n2d2"]
 
 
@@ -3846,7 +4823,7 @@ def _gemini_imagegen_worker(scene_name, snapshot, prompts, assign_first_output=F
         last_output_path = ""
         last_metadata_path = ""
         output_dir = ""
-        label = snapshot.get("model_label") or "Nano"
+        label = snapshot.get("model_label") or "Gemini Flash"
 
         for index, prompt in enumerate(prompts, start=1):
             progress = f"{index}/{total}" if total > 1 else ""
@@ -3871,12 +4848,12 @@ def _gemini_imagegen_worker(scene_name, snapshot, prompts, assign_first_output=F
 
         assigned_output_path = first_output_path if assign_first_output and first_output_path else last_output_path
         assigned_metadata_path = first_metadata_path if assign_first_output and first_metadata_path else last_metadata_path
-        final_status = "Nano image generated and assigned to Image."
+        final_status = "Gemini Flash image generated and assigned to Image."
         if generated_images > 1:
             final_status = (
-                f"Generated {generated_images} Nano images. First breakout image assigned to Image."
+                f"Generated {generated_images} Gemini Flash images. First breakout image assigned to Image."
                 if assign_first_output
-                else f"Generated {generated_images} Nano images. Last image assigned to Image."
+                else f"Generated {generated_images} Gemini Flash images. Last image assigned to Image."
             )
         _emit_status(
             scene_name,
@@ -3905,12 +4882,186 @@ def _gemini_imagegen_worker(scene_name, snapshot, prompts, assign_first_output=F
         )
 
 
+def _part_planning_worker(scene_name, snapshot):
+    try:
+        source_image_path = snapshot.get("guide_image_path") or ""
+        guidance = snapshot.get("part_extraction_guidance") or DEFAULT_PART_EXTRACTION_GUIDANCE
+        model_id = snapshot.get("part_planner_model") or GEMINI_PLANNER_MODEL_IDS["gemini_2_5_flash"]
+        model_label = snapshot.get("part_planner_label") or _part_planner_model_label(model_id)
+        prompt = _part_extraction_planning_prompt(
+            guidance,
+            base_include_face=bool(snapshot.get("part_base_include_face")),
+            base_include_eyes=bool(snapshot.get("part_base_include_eyes")),
+            include_eye_part=bool(snapshot.get("part_include_eye_part")),
+        )
+        _emit_status(
+            scene_name,
+            imagegen_task_status="processing",
+            imagegen_task_stage="Planning Character Parts",
+            imagegen_task_detail=f"{model_label} is identifying extractable assets...",
+            imagegen_task_progress="",
+            imagegen_status_text="Planning character parts...",
+        )
+        response_text, detail = _openrouter_text_from_image(
+            snapshot["api_key"],
+            model_id,
+            snapshot["guide_image_data_url"],
+            prompt,
+        )
+        raw_plan = _extract_json_payload(response_text)
+        plan = _normalize_part_plan(raw_plan, max_parts=snapshot.get("part_extraction_max_parts", 8))
+        plan = _ensure_required_part_plan_entries(plan, snapshot)
+        plan_payload = {
+            "source_image_path": source_image_path,
+            "planner_model": model_id,
+            "guidance": guidance,
+            "parts": plan["parts"],
+            "response_text": response_text,
+            "response": _gemini_safe_response_for_metadata(detail),
+        }
+        plan_path = _parts_metadata_path("parts-plan")
+        with open(plan_path, "w", encoding="utf-8") as handle:
+            json.dump(plan_payload, handle, indent=2)
+            handle.write("\n")
+        plan_json = json.dumps({"parts": plan["parts"]}, indent=2)
+        count = len(plan["parts"])
+        _emit_status(
+            scene_name,
+            imagegen_is_busy=False,
+            imagegen_started_at=0.0,
+            imagegen_task_status="idle",
+            imagegen_task_stage="",
+            imagegen_task_detail="",
+            imagegen_task_progress="",
+            imagegen_status_text=f"Planned {count} character parts. Review, then Extract Parts.",
+            imagegen_output_dir=os.path.dirname(plan_path),
+            part_extraction_source_path=source_image_path,
+            part_extraction_plan_json=plan_json,
+            part_extraction_plan_path=plan_path,
+            part_extraction_results_path="",
+        )
+    except Exception as exc:
+        _emit_status(
+            scene_name,
+            imagegen_is_busy=False,
+            imagegen_started_at=0.0,
+            imagegen_task_status="idle",
+            imagegen_task_stage="",
+            imagegen_task_detail="",
+            imagegen_task_progress="",
+            imagegen_status_text=str(exc),
+        )
+
+
+def _part_extraction_worker(scene_name, snapshot, plan_json):
+    try:
+        plan = _part_plan_from_json_text(plan_json)
+        parts = plan.get("parts", [])
+        if not parts:
+            raise RuntimeError("Plan parts before extracting.")
+        guidance = snapshot.get("part_extraction_guidance") or DEFAULT_PART_EXTRACTION_GUIDANCE
+        style_text = snapshot.get("part_extraction_style") or ""
+        style_label = snapshot.get("part_extraction_style_label") or ""
+        total = len(parts)
+        outputs = []
+        first_output_path = ""
+        first_metadata_path = ""
+        selected_output_path = ""
+        selected_metadata_path = ""
+        output_dir = ""
+
+        for index, part in enumerate(parts, start=1):
+            display_name = part.get("display_name") or part.get("id") or f"Part {index}"
+            part_id = _sanitize_name_fragment(part.get("id") or display_name, fallback=f"part-{index:02d}")
+            _emit_status(
+                scene_name,
+                imagegen_task_status="processing",
+                imagegen_task_stage="Extracting Character Parts",
+                imagegen_task_detail=f"Extracting {index}/{total}: {display_name}",
+                imagegen_task_progress=f"{index}/{total}",
+                imagegen_status_text=f"Extracting {display_name}...",
+            )
+            prompt = _part_extraction_prompt(
+                part,
+                guidance,
+                style_text,
+                style_label,
+                base_include_face=bool(snapshot.get("part_base_include_face")),
+                base_include_eyes=bool(snapshot.get("part_base_include_eyes")),
+            )
+            saved_outputs = _gemini_request_image(snapshot, prompt, f"part-{index:02d}-{part_id}")
+            if not saved_outputs:
+                raise RuntimeError(f"Gemini Flash did not return an image for {display_name}.")
+            output_path, metadata_path = saved_outputs[0]
+            output_dir = os.path.dirname(output_path)
+            if not first_output_path:
+                first_output_path = output_path
+                first_metadata_path = metadata_path
+            category = (part.get("category") or "").lower()
+            identifier = f"{part.get('id', '')} {display_name}".lower()
+            if not selected_output_path and (
+                category == "anatomy_base" or "anatomy" in identifier or "base" in identifier or "body" in identifier
+            ):
+                selected_output_path = output_path
+                selected_metadata_path = metadata_path
+            outputs.append(
+                {
+                    "part": part,
+                    "output_path": output_path,
+                    "metadata_path": metadata_path,
+                    "extra_output_count": max(0, len(saved_outputs) - 1),
+                }
+            )
+
+        assigned_output_path = selected_output_path or first_output_path
+        assigned_metadata_path = selected_metadata_path or first_metadata_path
+        results_payload = {
+            "source_image_path": snapshot.get("guide_image_path") or "",
+            "extractor_model": snapshot.get("model_id") or "",
+            "guidance": guidance,
+            "style": style_text,
+            "style_label": style_label,
+            "outputs": outputs,
+        }
+        results_path = _parts_metadata_path("parts-results")
+        with open(results_path, "w", encoding="utf-8") as handle:
+            json.dump(results_payload, handle, indent=2)
+            handle.write("\n")
+
+        _emit_status(
+            scene_name,
+            imagegen_is_busy=False,
+            imagegen_started_at=0.0,
+            imagegen_task_status="idle",
+            imagegen_task_stage="",
+            imagegen_task_detail="",
+            imagegen_task_progress="",
+            imagegen_status_text=f"Extracted {len(outputs)} character parts. Base/body assigned to Image.",
+            imagegen_output_path=assigned_output_path,
+            imagegen_output_dir=output_dir,
+            imagegen_metadata_path=assigned_metadata_path,
+            image_path=assigned_output_path,
+            part_extraction_results_path=results_path,
+        )
+    except Exception as exc:
+        _emit_status(
+            scene_name,
+            imagegen_is_busy=False,
+            imagegen_started_at=0.0,
+            imagegen_status_text=str(exc),
+            imagegen_task_status="idle",
+            imagegen_task_stage="",
+            imagegen_task_detail="",
+            imagegen_task_progress="",
+        )
+
+
 def _gemini_mv_worker(scene_name, snapshot, prompts):
     try:
         assigned = {}
         metadata_paths = {}
         folder_path = ""
-        label = snapshot.get("model_label") or "Nano"
+        label = snapshot.get("model_label") or "Gemini Flash"
         for index, (view_key, view_label, prompt) in enumerate(prompts, start=1):
             progress_text = f"{index}/4"
             _emit_status(
@@ -3923,7 +5074,7 @@ def _gemini_mv_worker(scene_name, snapshot, prompts):
             )
             saved_outputs = _gemini_request_image(snapshot, prompt, f"gemini-{view_key}")
             if not saved_outputs:
-                raise RuntimeError(f"Nano did not return a {view_label.lower()} view image.")
+                raise RuntimeError(f"Gemini Flash did not return a {view_label.lower()} view image.")
             output_path, metadata_path = saved_outputs[0]
             assigned[view_key] = output_path
             metadata_paths[view_key] = metadata_path
@@ -3934,7 +5085,7 @@ def _gemini_mv_worker(scene_name, snapshot, prompts):
             scene_name,
             imagegen_is_busy=False,
             imagegen_started_at=0.0,
-            imagegen_status_text="Nano MV set generated and assigned to multiview slots.",
+            imagegen_status_text="Gemini Flash MV set generated and assigned to multiview slots.",
             imagegen_task_status="idle",
             imagegen_task_stage="",
             imagegen_task_detail="",
@@ -4040,6 +5191,24 @@ def _imagegen_mv_worker(scene_name, api_root, seed):
             imagegen_task_detail="",
             imagegen_task_progress="",
         )
+
+
+class NymphsPartPlanItem(bpy.types.PropertyGroup):
+    selected: BoolProperty(
+        name="Selected",
+        description="Include this part when Extract runs",
+        default=True,
+    )
+    symmetry: BoolProperty(
+        name="Symmetry",
+        description="Force this extracted part to stay perfectly left-right symmetrical",
+        default=False,
+    )
+    part_id: StringProperty(default="")
+    display_name: StringProperty(default="")
+    category: StringProperty(default="")
+    extraction_prompt: StringProperty(default="")
+    normalized_bbox_json: StringProperty(default="")
 
 
 class NymphsV2State(bpy.types.PropertyGroup):
@@ -4475,13 +5644,15 @@ class NymphsV2State(bpy.types.PropertyGroup):
     show_startup: BoolProperty(default=False)
     show_texture_settings: BoolProperty(default=False)
     show_image_generation: BoolProperty(default=False)
+    show_part_extraction: BoolProperty(default=False)
     show_advanced: BoolProperty(default=False)
     show_shape: BoolProperty(default=False)
     show_texture: BoolProperty(default=False)
     imagegen_prompt_text_name: StringProperty(default="")
+    part_extraction_guidance_text_name: StringProperty(default="")
     imagegen_backend: EnumProperty(
         name="Image Backend",
-        description="Choose whether image prompts run on the local Z-Image server or Gemini's Nano Banana image API through OpenRouter.",
+        description="Choose whether image prompts run on the local Z-Image server or Gemini Flash image generation through OpenRouter.",
         items=(
             ("Z_IMAGE", "Z-Image", "Use the local Z-Image backend"),
             ("GEMINI", "Gemini Flash", "Use Gemini image generation through OpenRouter"),
@@ -4490,28 +5661,29 @@ class NymphsV2State(bpy.types.PropertyGroup):
     )
     openrouter_api_key: StringProperty(
         name="API",
-        description="OpenRouter API key for Nano image generation. Leave blank to use OPENROUTER_API_KEY from the environment instead.",
+        description="OpenRouter API key for Gemini Flash image generation. Leave blank to use OPENROUTER_API_KEY from the environment instead.",
         subtype="PASSWORD",
         default="",
+        update=_on_openrouter_api_key_changed,
     )
     gemini_model: EnumProperty(
         name="Model",
-        description="Nano image model to call through OpenRouter.",
+        description="Gemini Flash image model to call through OpenRouter.",
         items=(
-            ("gemini_2_5_flash_image", "Gemini 2.5 Flash Image", "Nano Banana through OpenRouter. Fast 1024px image generation."),
-            ("gemini_3_1_flash_image_preview", "Gemini 3.1 Flash Image", "Nano Banana 2 preview through OpenRouter. Newer Flash image model with optional larger output sizes."),
-            ("gemini_3_pro_image_preview", "Gemini 3 Pro Image", "Nano Banana Pro preview through OpenRouter for more complex image instructions."),
+            ("gemini_2_5_flash_image", "Gemini 2.5 Flash Image", "Fast 1024px image generation through OpenRouter."),
+            ("gemini_3_1_flash_image_preview", "Gemini 3.1 Flash Image", "Newer Flash image model with optional larger output sizes."),
+            ("gemini_3_pro_image_preview", "Gemini 3 Pro Image", "Pro preview for more complex image instructions."),
         ),
         default="gemini_2_5_flash_image",
     )
     gemini_use_guide_image: BoolProperty(
         name="Guide Image",
-        description="Send one picked image along with the prompt so Nano can edit from or stay closer to an existing design.",
+        description="Send one picked image along with the prompt so Gemini can edit from or stay closer to an existing design.",
         default=False,
     )
     gemini_guide_image_path: StringProperty(
         name="Guide",
-        description="Image file to send with the Nano prompt. Use Pick to choose from the current generated-image folder.",
+        description="Image file to send with the Gemini prompt. Use Pick to choose from the current generated-image folder.",
         subtype="FILE_PATH",
         default="",
     )
@@ -4548,9 +5720,10 @@ class NymphsV2State(bpy.types.PropertyGroup):
         default="",
     )
     imagegen_prompt_preset: EnumProperty(
-        name="Presets",
-        description="Load a reusable prompt. Image settings stay unchanged.",
-        items=_imagegen_prompt_preset_items,
+        name="Subject",
+        description="Managed subject prompt block shown in the visible prompt.",
+        items=_imagegen_subject_preset_items,
+        update=_on_imagegen_managed_prompt_changed,
     )
     imagegen_style: StringProperty(
         name="Style",
@@ -4558,9 +5731,16 @@ class NymphsV2State(bpy.types.PropertyGroup):
         default="",
     )
     imagegen_style_preset: EnumProperty(
-        name="Styles",
-        description="Pick a reusable style fragment to inject into the generated prompt.",
+        name="Style",
+        description="Managed style prompt block shown in the visible prompt.",
         items=_imagegen_style_preset_items,
+        update=_on_imagegen_managed_prompt_changed,
+    )
+    imagegen_saved_prompt_preset: EnumProperty(
+        name="Saved Prompt",
+        description="Saved full prompt to load into the visible prompt.",
+        items=_imagegen_saved_prompt_items,
+        update=_on_imagegen_saved_prompt_changed,
     )
     imagegen_settings_preset: EnumProperty(
         name="Generation Profile",
@@ -4607,6 +5787,11 @@ class NymphsV2State(bpy.types.PropertyGroup):
         min=1,
         max=8,
     )
+    imagegen_generate_mv: BoolProperty(
+        name="4-View MV",
+        description="Generate front, left, right, and back views instead of a single image or variants.",
+        default=False,
+    )
     imagegen_seed_step: IntProperty(
         name="Seed Step",
         description="Seed increment for single-image variants. Generate 4-View MV uses one seed across its four view prompts.",
@@ -4636,6 +5821,67 @@ class NymphsV2State(bpy.types.PropertyGroup):
         name="Last Image Metadata",
         default="",
     )
+    part_planner_model: EnumProperty(
+        name="Model",
+        description="Vision model used to identify extractable character parts before spending on image edits.",
+        items=(
+            ("gemini_2_5_flash", "Gemini 2.5 Flash", "Lower-cost vision planning through OpenRouter"),
+            ("gemini_3_1_pro_preview", "Gemini 3.1 Pro", "Higher-quality vision planning for harder character references"),
+        ),
+        default="gemini_2_5_flash",
+    )
+    part_extraction_max_parts: IntProperty(
+        name="Max Parts",
+        description="Maximum parts to include in one extraction plan. This controls cost before image edits run.",
+        default=8,
+        min=1,
+        max=16,
+    )
+    part_extraction_guidance: StringProperty(
+        name="Guidance",
+        description="Extra guidance applied to every character-part extraction request.",
+        default=DEFAULT_PART_EXTRACTION_GUIDANCE,
+    )
+    part_extraction_style_lock: BoolProperty(
+        name="Style Lock",
+        description="Apply the active Style field strongly during guided part extraction.",
+        default=True,
+    )
+    part_base_include_face: BoolProperty(
+        name="Face",
+        description="Keep facial features on the anatomy base extraction instead of leaving the head feature-neutral.",
+        default=False,
+        update=_on_part_extraction_option_changed,
+    )
+    part_base_include_eyes: BoolProperty(
+        name="Eyes In Base",
+        description="When Face is on, keep finished eyes on the anatomy base instead of leaving the eye area blank.",
+        default=False,
+        update=_on_part_extraction_option_changed,
+    )
+    part_include_eye_part: BoolProperty(
+        name="Add Eyeball Part",
+        description="Add one separate reusable eyeball-only extraction target.",
+        default=False,
+        update=_on_part_extraction_option_changed,
+    )
+    part_extraction_source_path: StringProperty(
+        name="Source",
+        default="",
+    )
+    part_extraction_plan_json: StringProperty(
+        name="Part Plan",
+        default="",
+    )
+    part_extraction_plan_path: StringProperty(
+        name="Part Plan Metadata",
+        default="",
+    )
+    part_extraction_results_path: StringProperty(
+        name="Part Extraction Metadata",
+        default="",
+    )
+    part_extraction_parts: CollectionProperty(type=NymphsPartPlanItem)
     imagegen_mv_received_at: FloatProperty(default=0.0)
     imagegen_mv_received_source: StringProperty(default="")
     shape_output_path: StringProperty(
@@ -5149,6 +6395,8 @@ class NYMPHSV2_OT_generate_image(bpy.types.Operator):
         if state.is_busy or state.imagegen_is_busy:
             self.report({"WARNING"}, "Another request is already running.")
             return {"CANCELLED"}
+        if bool(getattr(state, "imagegen_generate_mv", False)):
+            return bpy.ops.nymphsv2.generate_mv_set()
 
         backend = getattr(state, "imagegen_backend", "Z_IMAGE")
         breakout_auto_mode = False
@@ -5162,7 +6410,8 @@ class NYMPHSV2_OT_generate_image(bpy.types.Operator):
                     raise RuntimeError("Enter an image-generation prompt first.")
                 snapshot = _gemini_snapshot(state)
                 preset_key = _sync_imagegen_prompt_preset(state)
-                if preset_key == "character_part_breakout":
+                _preset_kind, preset_id = _split_prompt_preset_key(preset_key)
+                if preset_id == "character_part_breakout":
                     payload = [_character_part_breakout_auto_prompt(prompt)]
                     assign_first_output = True
                     breakout_auto_mode = True
@@ -5177,7 +6426,8 @@ class NYMPHSV2_OT_generate_image(bpy.types.Operator):
                 _require_network_access(api_root)
                 seed_step = max(1, int(getattr(state, "imagegen_seed_step", 1)))
                 preset_key = _sync_imagegen_prompt_preset(state)
-                if preset_key == "character_part_breakout":
+                _preset_kind, preset_id = _split_prompt_preset_key(preset_key)
+                if preset_id == "character_part_breakout":
                     prompt_sequence = _character_part_breakout_variant_prompts(_resolved_imagegen_prompt(state), variant_count)
                     if variant_count > 1:
                         base_seed, generated = _imagegen_seed_value(state)
@@ -5314,6 +6564,80 @@ class NYMPHSV2_OT_generate_mv_set(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class NYMPHSV2_OT_clear_managed_prompt_presets(bpy.types.Operator):
+    bl_idname = "nymphsv2.clear_managed_prompt_presets"
+    bl_label = "Clear Prompt Blocks"
+    bl_description = "Clear the managed Subject and Style prompt blocks from the visible prompt"
+
+    def execute(self, context):
+        state = context.scene.nymphs_state
+        _clear_imagegen_managed_prompt_blocks(state, reset_dropdowns=True)
+        state.imagegen_status_text = "Cleared Subject and Style prompt blocks."
+        _touch_ui()
+        return {"FINISHED"}
+
+
+class NYMPHSV2_OT_insert_saved_prompt(bpy.types.Operator):
+    bl_idname = "nymphsv2.insert_saved_prompt"
+    bl_label = "Insert Saved Prompt"
+    bl_description = "Insert the selected saved full prompt into the visible prompt"
+
+    def execute(self, context):
+        state = context.scene.nymphs_state
+        if not _load_selected_saved_prompt_into_prompt(state):
+            self.report({"ERROR"}, "Choose a saved prompt first.")
+            return {"CANCELLED"}
+        preset = _imagegen_prompt_preset_data(
+            _sync_imagegen_prompt_preset(state, "imagegen_saved_prompt_preset", PROMPT_KIND_SAVED),
+            PROMPT_KIND_SAVED,
+        )
+        state.imagegen_status_text = f"Loaded saved prompt: {preset.get('label', 'Saved Prompt')}"
+        _touch_ui()
+        return {"FINISHED"}
+
+
+class NYMPHSV2_OT_save_current_prompt(bpy.types.Operator):
+    bl_idname = "nymphsv2.save_current_prompt"
+    bl_label = "Save Current Prompt"
+    bl_description = "Save the current visible prompt as a reusable saved prompt"
+
+    name: StringProperty(
+        name="Saved Prompt Name",
+        default="",
+    )
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=420)
+
+    def execute(self, context):
+        state = context.scene.nymphs_state
+        _pull_imagegen_text_from_block(state, "prompt")
+        name = (self.name or "").strip()
+        if not name:
+            self.report({"ERROR"}, "Enter a saved prompt name.")
+            return {"CANCELLED"}
+        prompt = _resolved_imagegen_prompt(state)
+        if not prompt:
+            self.report({"ERROR"}, "Enter a prompt before saving.")
+            return {"CANCELLED"}
+        key = _prompt_preset_key(PROMPT_KIND_SAVED, name)
+        payload = _prompt_preset_payload(
+            name,
+            PROMPT_KIND_SAVED,
+            prompt,
+            f"Saved from Blender on {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        )
+        with open(_imagegen_preset_file(key), "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.write("\n")
+        _clear_prompt_preset_cache()
+        state.imagegen_saved_prompt_preset = key
+        _sync_imagegen_prompt_preset(state, "imagegen_saved_prompt_preset", PROMPT_KIND_SAVED)
+        state.imagegen_status_text = f"Saved prompt: {name}"
+        _touch_ui()
+        return {"FINISHED"}
+
+
 class NYMPHSV2_OT_load_prompt_preset(bpy.types.Operator):
     bl_idname = "nymphsv2.load_prompt_preset"
     bl_label = "Load Preset"
@@ -5322,7 +6646,7 @@ class NYMPHSV2_OT_load_prompt_preset(bpy.types.Operator):
     def execute(self, context):
         state = context.scene.nymphs_state
         preset = _imagegen_prompt_preset_data(_sync_imagegen_prompt_preset(state))
-        state.imagegen_prompt = preset["prompt"]
+        _set_imagegen_prompt_value(state, "prompt", preset["prompt"])
         state.imagegen_status_text = f"Loaded preset: {preset['label']}"
         _touch_ui()
         return {"FINISHED"}
@@ -5703,14 +7027,15 @@ class NYMPHSV2_OT_clear_image_prompt_field(bpy.types.Operator):
         name="Target",
         items=(
             ("prompt", "Prompt", "Clear the main prompt"),
+            ("guidance", "Guidance", "Clear part extraction guidance"),
         ),
         default="prompt",
     )
 
     def execute(self, context):
         state = context.scene.nymphs_state
-        state.imagegen_prompt = ""
-        state.imagegen_status_text = "Cleared image prompt."
+        _set_imagegen_prompt_value(state, self.target, "")
+        state.imagegen_status_text = "Cleared guidance." if self.target == "guidance" else "Cleared image prompt."
         _touch_ui()
         return {"FINISHED"}
 
@@ -5724,6 +7049,7 @@ class NYMPHSV2_OT_open_image_prompt_text_block(bpy.types.Operator):
         name="Target",
         items=(
             ("prompt", "Prompt", "Open the main prompt in a Blender text block"),
+            ("guidance", "Guidance", "Open part extraction guidance in a Blender text block"),
         ),
         default="prompt",
     )
@@ -5732,10 +7058,11 @@ class NYMPHSV2_OT_open_image_prompt_text_block(bpy.types.Operator):
         state = context.scene.nymphs_state
         text = _ensure_imagegen_text(state, self.target)
         opened = _open_text_in_editor(context, text)
+        label = "guidance" if self.target == "guidance" else "prompt"
         if opened:
-            state.status_text = "Editing prompt in Text Editor. Return here and click Apply Text."
+            state.status_text = f"Editing {label} in Text Editor. Return here and click Apply."
         else:
-            state.status_text = f"Prepared prompt text block: {text.name}"
+            state.status_text = f"Prepared {label} text block: {text.name}"
             self.report({"INFO"}, f"Text block ready: {text.name}. Open a Blender Text Editor area to edit it.")
         _touch_ui()
         return {"FINISHED"}
@@ -5750,6 +7077,7 @@ class NYMPHSV2_OT_pull_image_prompt_text_block(bpy.types.Operator):
         name="Target",
         items=(
             ("prompt", "Prompt", "Use the linked prompt text block"),
+            ("guidance", "Guidance", "Use the linked guidance text block"),
         ),
         default="prompt",
     )
@@ -5757,12 +7085,12 @@ class NYMPHSV2_OT_pull_image_prompt_text_block(bpy.types.Operator):
     def execute(self, context):
         state = context.scene.nymphs_state
         applied = []
-        if _pull_imagegen_text_from_block(state, "prompt"):
-            applied.append("prompt")
+        if _pull_imagegen_text_from_block(state, self.target):
+            applied.append("guidance" if self.target == "guidance" else "prompt")
         if not applied:
-            self.report({"WARNING"}, "No linked prompt text block was found.")
+            self.report({"WARNING"}, "No linked text block was found.")
             return {"CANCELLED"}
-        state.imagegen_status_text = "Loaded text from Blender Text Editor."
+        state.imagegen_status_text = "Applied text from Blender Text Editor."
         _touch_ui()
         return {"FINISHED"}
 
@@ -5776,6 +7104,7 @@ class NYMPHSV2_OT_edit_image_prompts(bpy.types.Operator):
         name="Target",
         items=(
             ("prompt", "Prompt", "Edit the main prompt"),
+            ("guidance", "Guidance", "Edit part extraction guidance"),
         ),
         default="prompt",
     )
@@ -5801,7 +7130,7 @@ class NYMPHSV2_OT_edit_image_prompts(bpy.types.Operator):
         layout.use_property_decorate = False
 
         body = layout.column(align=True)
-        body.label(text="Prompt")
+        body.label(text="Guidance" if self.target == "guidance" else "Prompt")
         prompt_row = body.row()
         prompt_row.scale_y = 3.0
         prompt_row.prop(self, "prompt", text="")
@@ -5809,15 +7138,51 @@ class NYMPHSV2_OT_edit_image_prompts(bpy.types.Operator):
 
     def execute(self, context):
         state = context.scene.nymphs_state
-        setattr(state, _imagegen_text_field_name(self.target), self.prompt)
+        _set_imagegen_prompt_value(state, self.target, self.prompt)
         _touch_ui()
+        return {"FINISHED"}
+
+
+class NYMPHSV2_OT_preview_image_prompt(bpy.types.Operator):
+    bl_idname = "nymphsv2.preview_image_prompt"
+    bl_label = "Prompt Preview"
+    bl_description = "Preview the current visible prompt"
+
+    target: EnumProperty(
+        name="Target",
+        items=(
+            ("prompt", "Prompt", "Preview the main prompt"),
+            ("guidance", "Guidance", "Preview part extraction guidance"),
+        ),
+        default="prompt",
+    )
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=760)
+
+    def draw(self, context):
+        state = context.scene.nymphs_state
+        layout = self.layout
+        layout.use_property_split = False
+        layout.use_property_decorate = False
+        value = (getattr(state, _imagegen_text_field_name(self.target), "") or "").strip()
+        title = "Guidance" if self.target == "guidance" else "Current Prompt"
+        if not value:
+            layout.label(text="No prompt text yet.")
+            return
+        body = layout.column(align=True)
+        body.label(text=title)
+        for line in _wrap_panel_text(value, width=96, max_lines=24):
+            body.label(text=line)
+
+    def execute(self, context):
         return {"FINISHED"}
 
 
 class NYMPHSV2_OT_pick_gemini_guide_image(bpy.types.Operator):
     bl_idname = "nymphsv2.pick_gemini_guide_image"
     bl_label = "Pick Guide Image"
-    bl_description = "Choose a guide image for Nano from the current generated-image folder"
+    bl_description = "Choose a guide image for Gemini Flash from the current generated-image folder"
 
     filepath: StringProperty(subtype="FILE_PATH")
     filter_glob: StringProperty(default="*.png;*.jpg;*.jpeg;*.webp;*.gif", options={"HIDDEN"})
@@ -5852,12 +7217,181 @@ class NYMPHSV2_OT_pick_gemini_guide_image(bpy.types.Operator):
 class NYMPHSV2_OT_clear_gemini_guide_image(bpy.types.Operator):
     bl_idname = "nymphsv2.clear_gemini_guide_image"
     bl_label = "Clear Guide"
-    bl_description = "Clear the Nano guide image path"
+    bl_description = "Clear the Gemini Flash guide image path"
 
     def execute(self, context):
         state = context.scene.nymphs_state
         state.gemini_guide_image_path = ""
         state.gemini_use_guide_image = False
+        _touch_ui()
+        return {"FINISHED"}
+
+
+class NYMPHSV2_OT_pick_part_master_image(bpy.types.Operator):
+    bl_idname = "nymphsv2.pick_part_master_image"
+    bl_label = "Pick Master"
+    bl_description = "Choose the master character image for guided part extraction"
+
+    filepath: StringProperty(subtype="FILE_PATH")
+    filter_glob: StringProperty(default="*.png;*.jpg;*.jpeg;*.webp;*.gif", options={"HIDDEN"})
+
+    def invoke(self, context, event):
+        state = context.scene.nymphs_state
+        current_path = (getattr(state, "part_extraction_source_path", "") or getattr(state, "image_path", "") or "").strip()
+        if current_path and os.path.isfile(_resolve_file_path(current_path)):
+            self.filepath = _resolve_file_path(current_path)
+        else:
+            self.filepath = os.path.join(_current_imagegen_folder(state), "")
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        state = context.scene.nymphs_state
+        selected_path = _resolve_file_path((self.filepath or "").strip())
+        if not selected_path or not os.path.exists(selected_path):
+            self.report({"ERROR"}, "Pick a master image first.")
+            return {"CANCELLED"}
+        _set_part_extraction_source_image(state, selected_path, "Master image selected for part extraction.")
+        _touch_ui()
+        return {"FINISHED"}
+
+
+class NYMPHSV2_OT_use_current_image_as_part_master(bpy.types.Operator):
+    bl_idname = "nymphsv2.use_current_image_as_part_master"
+    bl_label = "Use Image"
+    bl_description = "Use the current Image field as the master character reference"
+
+    def execute(self, context):
+        state = context.scene.nymphs_state
+        source_image_path = _resolve_file_path(getattr(state, "image_path", ""))
+        if not source_image_path or not os.path.exists(source_image_path):
+            self.report({"ERROR"}, "Pick or generate an Image first.")
+            return {"CANCELLED"}
+        _set_part_extraction_source_image(state, source_image_path, "Current Image set as part extraction master.")
+        _touch_ui()
+        return {"FINISHED"}
+
+
+class NYMPHSV2_OT_use_last_generated_as_part_master(bpy.types.Operator):
+    bl_idname = "nymphsv2.use_last_generated_as_part_master"
+    bl_label = "Use Last"
+    bl_description = "Use the last generated image as the master character reference"
+
+    def execute(self, context):
+        state = context.scene.nymphs_state
+        source_image_path = _resolve_file_path(getattr(state, "imagegen_output_path", ""))
+        if not source_image_path or not os.path.exists(source_image_path):
+            self.report({"ERROR"}, "No last generated image is available.")
+            return {"CANCELLED"}
+        _set_part_extraction_source_image(state, source_image_path, "Last generated image set as part extraction master.")
+        _touch_ui()
+        return {"FINISHED"}
+
+
+class NYMPHSV2_OT_plan_character_parts(bpy.types.Operator):
+    bl_idname = "nymphsv2.plan_character_parts"
+    bl_label = "Plan Parts"
+    bl_description = "Use the current Image as a master reference and ask Gemini to identify extractable character parts"
+
+    def execute(self, context):
+        state = context.scene.nymphs_state
+        if state.is_busy or state.imagegen_is_busy:
+            self.report({"WARNING"}, "Another request is already running.")
+            return {"CANCELLED"}
+        source_image_path = _resolve_file_path(getattr(state, "part_extraction_source_path", ""))
+        if not source_image_path:
+            self.report({"ERROR"}, "Choose a Source Image first.")
+            return {"CANCELLED"}
+        if not os.path.exists(source_image_path):
+            self.report({"ERROR"}, f"Image does not exist: {source_image_path}")
+            return {"CANCELLED"}
+        try:
+            _require_network_access(OPENROUTER_API_ROOT)
+            snapshot = _part_extraction_snapshot(state, source_image_path)
+        except Exception as exc:
+            state.imagegen_status_text = str(exc)
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+
+        state.imagegen_is_busy = True
+        state.imagegen_started_at = time.time()
+        state.imagegen_status_text = "Planning character parts..."
+        state.imagegen_task_status = "queued"
+        state.imagegen_task_stage = "Planning Character Parts"
+        state.imagegen_task_detail = f"{snapshot.get('part_planner_label', 'Planner')} will identify extractable assets."
+        state.imagegen_task_progress = ""
+        state.part_extraction_source_path = source_image_path
+        _clear_part_extraction_plan_state(state)
+        _touch_ui()
+
+        threading.Thread(
+            target=_part_planning_worker,
+            args=(context.scene.name, snapshot),
+            daemon=True,
+        ).start()
+        _schedule_event_loop()
+        return {"FINISHED"}
+
+
+class NYMPHSV2_OT_extract_character_parts(bpy.types.Operator):
+    bl_idname = "nymphsv2.extract_character_parts"
+    bl_label = "Extract Parts"
+    bl_description = "Run one Gemini Flash image-edit request per planned character part"
+
+    def execute(self, context):
+        state = context.scene.nymphs_state
+        if state.is_busy or state.imagegen_is_busy:
+            self.report({"WARNING"}, "Another request is already running.")
+            return {"CANCELLED"}
+        selected_plan = _selected_part_plan_from_state(state)
+        parts = selected_plan.get("parts", [])
+        planned_count = int(selected_plan.get("planned_count", 0) or 0)
+        if not planned_count:
+            self.report({"ERROR"}, "Plan parts before extracting.")
+            return {"CANCELLED"}
+        if not parts:
+            self.report({"ERROR"}, "Select at least one part to extract.")
+            return {"CANCELLED"}
+        source_image_path = _resolve_file_path(getattr(state, "part_extraction_source_path", "") or getattr(state, "image_path", ""))
+        if not source_image_path or not os.path.exists(source_image_path):
+            self.report({"ERROR"}, "The planned source image is missing. Pick the image and plan parts again.")
+            return {"CANCELLED"}
+        try:
+            _require_network_access(OPENROUTER_API_ROOT)
+            snapshot = _part_extraction_snapshot(state, source_image_path)
+        except Exception as exc:
+            state.imagegen_status_text = str(exc)
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+
+        state.imagegen_is_busy = True
+        state.imagegen_started_at = time.time()
+        state.imagegen_status_text = f"Extracting {len(parts)} character parts..."
+        state.imagegen_task_status = "queued"
+        state.imagegen_task_stage = "Extracting Character Parts"
+        state.imagegen_task_detail = f"Using {_gemini_model_label(snapshot.get('model_id'))} with current Image as guide."
+        state.imagegen_task_progress = f"0/{len(parts)}"
+        state.part_extraction_results_path = ""
+        _touch_ui()
+
+        threading.Thread(
+            target=_part_extraction_worker,
+            args=(context.scene.name, snapshot, json.dumps({"parts": parts}, indent=2)),
+            daemon=True,
+        ).start()
+        _schedule_event_loop()
+        return {"FINISHED"}
+
+
+class NYMPHSV2_OT_clear_character_part_plan(bpy.types.Operator):
+    bl_idname = "nymphsv2.clear_character_part_plan"
+    bl_label = "Clear Plan"
+    bl_description = "Clear the current character-part extraction plan"
+
+    def execute(self, context):
+        state = context.scene.nymphs_state
+        _clear_part_extraction_plan_state(state)
+        state.imagegen_status_text = "Cleared character part plan."
         _touch_ui()
         return {"FINISHED"}
 
@@ -5960,16 +7494,6 @@ class NYMPHSV2_PT_server(bpy.types.Panel):
         state = context.scene.nymphs_state
         layout = self.layout
 
-        layout.prop(
-            state,
-            "show_server",
-            text="Server",
-            icon="TRIA_DOWN" if state.show_server else "TRIA_RIGHT",
-            emboss=False,
-        )
-        if not state.show_server:
-            return
-
         top = layout.box()
         progress_stage, progress_detail, progress_value = _server_panel_job_lines(state)
         current_job = progress_stage or "Idle"
@@ -6049,6 +7573,17 @@ class NYMPHSV2_PT_server(bpy.types.Panel):
             gpu_box.label(text=f"Driver Status: {state.gpu_status_message}"[:160])
 
 
+def _draw_imagegen_status_box(layout, state):
+    image_status = (state.imagegen_status_text or "").strip()
+    result = layout.box()
+    result.label(text=f"Status: {image_status or 'Ready'}"[:160])
+    if state.imagegen_output_path:
+        result.label(text=f"Last Image: {_path_leaf(state.imagegen_output_path)}"[:160])
+    action_row = result.row(align=True)
+    action_row.operator("nymphsv2.open_imagegen_folder", text="Open Folder")
+    action_row.operator("nymphsv2.clear_imagegen_folder", text="Clear Folder")
+
+
 class NYMPHSV2_PT_image_generation(bpy.types.Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
@@ -6060,147 +7595,206 @@ class NYMPHSV2_PT_image_generation(bpy.types.Panel):
         layout = self.layout
 
         panel = layout.box()
-        panel.prop(
+        image_backend = getattr(state, "imagegen_backend", "Z_IMAGE")
+        _draw_imagegen_status_box(panel, state)
+
+        generation_box = panel.box()
+        generation_box.prop(
             state,
             "show_image_generation",
             text="Image Generation",
             icon="TRIA_DOWN" if state.show_image_generation else "TRIA_RIGHT",
             emboss=False,
         )
-        if not state.show_image_generation:
-            return
+        if state.show_image_generation:
+            backend_row = generation_box.row(align=True)
+            backend_row.prop(state, "imagegen_backend", expand=True)
+            image_backend = getattr(state, "imagegen_backend", "Z_IMAGE")
 
-        backend_row = panel.row(align=True)
-        backend_row.prop(state, "imagegen_backend", expand=True)
-        image_backend = getattr(state, "imagegen_backend", "Z_IMAGE")
+            if image_backend == "Z_IMAGE" and not _service_runtime_is_available(state, "n2d2"):
+                hint = generation_box.box()
+                hint.label(text="Start Z-Image in Runtimes.")
+                _draw_service_control_row(hint, state, "n2d2")
+            else:
+                _sync_imagegen_prompt_preset(state)
+                if image_backend == "Z_IMAGE":
+                    _sync_imagegen_settings_preset(state)
 
-        if image_backend == "Z_IMAGE" and not _service_runtime_is_available(state, "n2d2"):
-            hint = panel.box()
-            hint.label(text="Start Z-Image in Runtimes.")
-            _draw_service_control_row(hint, state, "n2d2")
-            return
+                if image_backend == "Z_IMAGE":
+                    _draw_service_control_row(generation_box, state, "n2d2")
+                elif not _online_access_enabled():
+                    warning = generation_box.box()
+                    warning.label(text="Enable Blender online access to use Gemini.")
 
-        _sync_imagegen_prompt_preset(state)
-        if image_backend == "Z_IMAGE":
-            _sync_imagegen_settings_preset(state)
+                request = generation_box.box()
 
-        if image_backend == "Z_IMAGE":
-            _draw_service_control_row(panel, state, "n2d2")
-        elif not _online_access_enabled():
-            warning = panel.box()
-            warning.label(text="Enable Blender online access to use Gemini.")
+                if image_backend == "Z_IMAGE":
+                    settings_label_row = request.row(align=True)
+                    settings_label_row.label(text="Profile")
+                    settings_label_row.operator("nymphsv2.load_imagegen_settings_preset", text="Apply")
+                    settings_preset_row = request.row(align=True)
+                    settings_preset_row.prop(state, "imagegen_settings_preset", text="")
+                    settings_preset_tools = request.row(align=True)
+                    settings_preset_tools.operator("nymphsv2.save_imagegen_settings_preset", text="Save")
+                    settings_preset_tools.operator("nymphsv2.delete_imagegen_settings_preset", text="Delete")
+                    settings_preset_tools.operator("nymphsv2.open_imagegen_settings_presets_folder", text="Open")
+                else:
+                    gemini_box = request.box()
+                    _ensure_openrouter_api_key_loaded(state)
+                    gemini_model_row = gemini_box.split(factor=0.42, align=True)
+                    gemini_model_row.label(text="Gemini Flash")
+                    gemini_model_row.prop(state, "gemini_model", text="")
+                    gemini_box.prop(state, "openrouter_api_key", text="API")
+                    gemini_row = gemini_box.row(align=True)
+                    gemini_row.prop(state, "gemini_aspect_ratio")
+                    if _gemini_model_id(state) in GEMINI_IMAGE_SIZE_MODELS:
+                        gemini_row.prop(state, "gemini_image_size")
+                    guide_box = gemini_box.box()
+                    guide_toggle_row = guide_box.row(align=True)
+                    guide_toggle_row.prop(state, "gemini_use_guide_image")
+                    if state.gemini_use_guide_image:
+                        guide_box.prop(state, "gemini_guide_image_path", text="Guide")
+                        guide_actions = guide_box.row(align=True)
+                        guide_actions.operator("nymphsv2.pick_gemini_guide_image", text="Pick")
+                        guide_actions.operator("nymphsv2.clear_gemini_guide_image", text="Clear")
+                    if not (state.openrouter_api_key or os.environ.get("OPENROUTER_API_KEY")):
+                        gemini_box.label(text="Uses OPENROUTER_API_KEY when the field is blank.")
 
-        request = panel.box()
+                prompts_box = request.box()
+                prompts_box.label(text="PROMPTS")
+                _sync_imagegen_prompt_preset(state, "imagegen_prompt_preset", PROMPT_KIND_SUBJECT)
+                _sync_imagegen_style_preset(state)
+                _sync_imagegen_managed_prompt_blocks(state)
+                subject_row = prompts_box.row(align=True)
+                subject_row.prop(state, "imagegen_prompt_preset", text="Subject")
+                style_preset_row = prompts_box.row(align=True)
+                style_preset_row.prop(state, "imagegen_style_preset", text="Style")
+                prompt_insert_tools = prompts_box.row(align=True)
+                prompt_insert_tools.operator("nymphsv2.open_prompt_presets_folder", text="Open")
 
-        if image_backend == "Z_IMAGE":
-            settings_label_row = request.row(align=True)
-            settings_label_row.label(text="Profile")
-            settings_label_row.operator("nymphsv2.load_imagegen_settings_preset", text="Apply")
-            settings_preset_row = request.row(align=True)
-            settings_preset_row.prop(state, "imagegen_settings_preset", text="")
-            settings_preset_tools = request.row(align=True)
-            settings_preset_tools.operator("nymphsv2.save_imagegen_settings_preset", text="Save")
-            settings_preset_tools.operator("nymphsv2.delete_imagegen_settings_preset", text="Delete")
-            settings_preset_tools.operator("nymphsv2.open_imagegen_settings_presets_folder", text="Open")
-        else:
-            gemini_box = request.box()
-            nano_row = gemini_box.row(align=True)
-            nano_row.label(text="Nano")
-            nano_row.prop(state, "gemini_model", text="")
-            gemini_box.prop(state, "openrouter_api_key", text="API")
-            gemini_row = gemini_box.row(align=True)
-            gemini_row.prop(state, "gemini_aspect_ratio")
-            if _gemini_model_id(state) in GEMINI_IMAGE_SIZE_MODELS:
-                gemini_row.prop(state, "gemini_image_size")
-            guide_box = gemini_box.box()
-            guide_toggle_row = guide_box.row(align=True)
-            guide_toggle_row.prop(state, "gemini_use_guide_image")
-            if state.gemini_use_guide_image:
-                guide_box.prop(state, "gemini_guide_image_path", text="Guide")
-                guide_actions = guide_box.row(align=True)
-                guide_actions.operator("nymphsv2.pick_gemini_guide_image", text="Pick")
-                guide_actions.operator("nymphsv2.clear_gemini_guide_image", text="Clear")
-            if not (state.openrouter_api_key or os.environ.get("OPENROUTER_API_KEY")):
-                gemini_box.label(text="Uses OPENROUTER_API_KEY when the field is blank.")
+                prompt_row = request.row(align=True)
+                prompt_row.label(text="Manual Prompt Editing")
+                prompt_tools_primary = request.row(align=True)
+                large_prompt = prompt_tools_primary.operator("nymphsv2.open_image_prompt_text_block", text="Editor")
+                large_prompt.target = "prompt"
+                use_prompt_text = prompt_tools_primary.operator("nymphsv2.pull_image_prompt_text_block", text="Apply")
+                use_prompt_text.target = "prompt"
+                prompt_tools_secondary = request.row(align=True)
+                edit_prompt = prompt_tools_secondary.operator("nymphsv2.edit_image_prompts", text="Quick Edit")
+                edit_prompt.target = "prompt"
+                prompt_tools_secondary.operator("nymphsv2.preview_image_prompt", text="Preview")
+                clear_prompt = prompt_tools_secondary.operator("nymphsv2.clear_image_prompt_field", text="Clear")
+                clear_prompt.target = "prompt"
+                if (state.imagegen_prompt or "").strip():
+                    _draw_wrapped_lines(request, state.imagegen_prompt, prefix="Text: ", width=52, max_lines=1)
+                else:
+                    request.label(text="No prompt text yet.")
+                _sync_imagegen_prompt_preset(state, "imagegen_saved_prompt_preset", PROMPT_KIND_SAVED)
+                saved_prompt_row = request.row(align=True)
+                saved_prompt_row.prop(state, "imagegen_saved_prompt_preset", text="Saved Prompt")
+                saved_prompt_tools = request.row(align=True)
+                saved_prompt_tools.operator("nymphsv2.save_current_prompt", text="Save Current")
+                if image_backend == "Z_IMAGE":
+                    size_row = request.row(align=True)
+                    size_row.prop(state, "imagegen_width")
+                    size_row.prop(state, "imagegen_height")
+                    settings_row = request.row(align=True)
+                    settings_row.prop(state, "imagegen_steps")
+                    settings_row.prop(state, "imagegen_guidance_scale")
 
-        prompt_preset_label_row = request.row(align=True)
-        prompt_preset_label_row.label(text="Prompt Preset")
-        prompt_preset_label_row.operator("nymphsv2.load_prompt_preset", text="Load")
-        prompt_preset_row = request.row(align=True)
-        prompt_preset_row.prop(state, "imagegen_prompt_preset", text="")
-        prompt_preset_tools = request.row(align=True)
-        prompt_preset_tools.operator("nymphsv2.save_prompt_preset", text="Save")
-        prompt_preset_tools.operator("nymphsv2.delete_prompt_preset", text="Delete")
-        prompt_preset_tools.operator("nymphsv2.open_prompt_presets_folder", text="Open")
+                    seed_row = request.row(align=True)
+                    seed_row.prop(state, "imagegen_seed", text="Seed")
+                variant_split = request.split(factor=0.62, align=True)
+                variant_row = variant_split.row(align=True)
+                variant_row.prop(state, "imagegen_variant_count")
+                mv_row = variant_split.row(align=True)
+                mv_row.prop(state, "imagegen_generate_mv")
+                if image_backend == "Z_IMAGE":
+                    variant_row.prop(state, "imagegen_seed_step", text="Step")
 
-        _sync_imagegen_style_preset(state)
-        style_preset_label_row = request.row(align=True)
-        style_preset_label_row.label(text="Style Preset")
-        style_preset_label_row.operator("nymphsv2.load_style_preset", text="Load")
-        style_preset_row = request.row(align=True)
-        style_preset_row.prop(state, "imagegen_style_preset", text="")
-        style_preset_tools = request.row(align=True)
-        style_preset_tools.operator("nymphsv2.save_style_preset", text="Save")
-        style_preset_tools.operator("nymphsv2.delete_style_preset", text="Delete")
-        style_preset_tools.operator("nymphsv2.open_style_presets_folder", text="Open")
-        style_row = request.row(align=True)
-        style_row.prop(state, "imagegen_style", text="Style")
-        style_row.operator("nymphsv2.clear_image_style_field", text="Clear")
+                if bool(getattr(state, "imagegen_generate_mv", False)):
+                    generate_label = "Generate 4-View MV"
+                else:
+                    generate_label = "Generate Image" if int(getattr(state, "imagegen_variant_count", 1)) <= 1 else "Generate Variants"
+                primary_action = request.row(align=True)
+                primary_action.enabled = not state.is_busy and not state.imagegen_is_busy
+                primary_action.scale_y = 1.25
+                primary_action.operator("nymphsv2.generate_image", text=generate_label, icon="RENDER_STILL")
 
-        prompt_row = request.row(align=True)
-        prompt_row.label(text="Prompt")
-        large_prompt = prompt_row.operator("nymphsv2.open_image_prompt_text_block", text="Text Editor")
-        large_prompt.target = "prompt"
-        prompt_tools = request.row(align=True)
-        edit_prompt = prompt_tools.operator("nymphsv2.edit_image_prompts", text="Edit")
-        edit_prompt.target = "prompt"
-        clear_prompt = prompt_tools.operator("nymphsv2.clear_image_prompt_field", text="Clear")
-        clear_prompt.target = "prompt"
-        if state.imagegen_prompt_text_name:
-            use_prompt_text = prompt_tools.operator("nymphsv2.pull_image_prompt_text_block", text="Apply Text")
-            use_prompt_text.target = "prompt"
-        prompt_field_row = request.row(align=True)
-        prompt_field_row.prop(state, "imagegen_prompt", text="")
-        if image_backend == "Z_IMAGE":
-            size_row = request.row(align=True)
-            size_row.prop(state, "imagegen_width")
-            size_row.prop(state, "imagegen_height")
-            settings_row = request.row(align=True)
-            settings_row.prop(state, "imagegen_steps")
-            settings_row.prop(state, "imagegen_guidance_scale")
+        if image_backend == "GEMINI":
+            parts_box = panel.box()
+            parts_box.prop(
+                state,
+                "show_part_extraction",
+                text="Image Part Extraction",
+                icon="TRIA_DOWN" if state.show_part_extraction else "TRIA_RIGHT",
+                emboss=False,
+            )
+        if image_backend == "GEMINI" and state.show_part_extraction:
+            extraction_source = (state.part_extraction_source_path or "").strip()
+            source_name = _path_leaf(extraction_source) if extraction_source else "No source image selected"
+            parts_box.label(text="Source Image")
+            _draw_wrapped_lines(parts_box, source_name, width=52, max_lines=1)
+            choose_row = parts_box.row(align=True)
+            choose_row.operator("nymphsv2.pick_part_master_image", text="Choose")
 
-            seed_row = request.row(align=True)
-            seed_row.prop(state, "imagegen_seed", text="Seed")
-        variant_row = request.row(align=True)
-        variant_row.prop(state, "imagegen_variant_count")
-        if image_backend == "Z_IMAGE":
-            variant_row.prop(state, "imagegen_seed_step", text="Step")
+            parts_box.label(text="Plan Parts")
+            model_row = parts_box.row(align=True)
+            model_row.prop(state, "part_planner_model", text="")
+            model_row.prop(state, "part_extraction_max_parts", text="Max")
+            plan_row = parts_box.row(align=True)
+            plan_row.enabled = not state.is_busy and not state.imagegen_is_busy
+            plan_row.operator("nymphsv2.plan_character_parts", text="Plan")
+            parts_box.prop(state, "part_extraction_style_lock")
+            base_row = parts_box.row(align=True)
+            base_row.prop(state, "part_base_include_face", toggle=True)
+            eyes_row = base_row.row(align=True)
+            eyes_row.enabled = bool(state.part_base_include_face)
+            eyes_row.prop(state, "part_base_include_eyes", toggle=True)
+            eye_part_row = parts_box.row(align=True)
+            eye_part_row.prop(state, "part_include_eye_part", toggle=True)
 
-        action = request.row(align=True)
-        action.enabled = not state.is_busy and not state.imagegen_is_busy
-        generate_label = "Generate Image" if int(getattr(state, "imagegen_variant_count", 1)) <= 1 else "Generate Variants"
-        action.operator("nymphsv2.generate_image", text=generate_label)
-        action.operator("nymphsv2.generate_mv_set", text="Generate 4-View MV")
+            parts_box.label(text="Extraction Prompt")
+            guidance_tools_primary = parts_box.row(align=True)
+            guidance_editor = guidance_tools_primary.operator("nymphsv2.open_image_prompt_text_block", text="Editor")
+            guidance_editor.target = "guidance"
+            guidance_apply = guidance_tools_primary.operator("nymphsv2.pull_image_prompt_text_block", text="Apply")
+            guidance_apply.target = "guidance"
+            guidance_tools_secondary = parts_box.row(align=True)
+            guidance_quick_edit = guidance_tools_secondary.operator("nymphsv2.edit_image_prompts", text="Quick Edit")
+            guidance_quick_edit.target = "guidance"
+            guidance_preview = guidance_tools_secondary.operator("nymphsv2.preview_image_prompt", text="Preview")
+            guidance_preview.target = "guidance"
+            guidance_clear = guidance_tools_secondary.operator("nymphsv2.clear_image_prompt_field", text="Clear")
+            guidance_clear.target = "guidance"
+            if (state.part_extraction_guidance or "").strip():
+                _draw_wrapped_lines(parts_box, state.part_extraction_guidance, prefix="Text: ", width=52, max_lines=1)
+            else:
+                parts_box.label(text="No guidance text yet.")
 
-        image_status = (state.imagegen_status_text or "").strip()
-        status_lower = image_status.lower()
-        has_image_output = bool(state.imagegen_output_dir.strip() or state.imagegen_output_path.strip())
-        passive_image_status = (
-            not image_status
-            or status_lower == "idle"
-            or (state.imagegen_output_path and status_lower.startswith("image generated"))
-            or (state.imagegen_output_path and status_lower.startswith("generated "))
-        )
-        if state.imagegen_is_busy or not passive_image_status or has_image_output:
-            result = panel.box()
-            if state.imagegen_is_busy or not passive_image_status:
-                result.label(text=f"Status: {image_status or 'Working...'}"[:160])
-            if state.imagegen_output_path:
-                result.label(text=f"Last Image: {_path_leaf(state.imagegen_output_path)}"[:160])
-            action_row = result.row(align=True)
-            action_row.enabled = has_image_output
-            action_row.operator("nymphsv2.open_imagegen_folder", text="Open Folder")
-            action_row.operator("nymphsv2.clear_imagegen_folder", text="Clear Folder")
+            parts_box.label(text="Parts")
+            planned_parts = _part_extraction_parts_from_state(state)
+            selected_count = sum(1 for item in planned_parts if bool(getattr(item, "selected", True)))
+            if planned_parts:
+                parts_box.label(text=f"{selected_count}/{len(planned_parts)} selected")
+                symmetry_header = parts_box.row(align=True)
+                symmetry_header.alignment = "RIGHT"
+                symmetry_header.label(text="Symmetry")
+                for item in planned_parts:
+                    part_label = (item.display_name or item.part_id or "Part").strip()
+                    part_row = parts_box.split(factor=0.92, align=True)
+                    part_row.prop(item, "selected", text=part_label)
+                    part_row.prop(item, "symmetry", text="")
+            elif state.part_extraction_plan_path:
+                parts_box.label(text="No usable parts in current plan.")
+            else:
+                parts_box.label(text="No plan yet.")
+            parts_actions = parts_box.row(align=True)
+            parts_actions.enabled = not state.is_busy and not state.imagegen_is_busy
+            extract_action = parts_actions.row(align=True)
+            extract_action.enabled = bool(selected_count)
+            extract_action.operator("nymphsv2.extract_character_parts", text=f"Extract Selected ({selected_count})")
+            parts_actions.operator("nymphsv2.clear_character_part_plan", text="Clear")
 
 
 def _panel_status_text(state):
@@ -6458,16 +8052,6 @@ class NYMPHSV2_PT_shape(bpy.types.Panel):
         layout = self.layout
 
         panel = layout.box()
-        panel.prop(
-            state,
-            "show_shape",
-            text="Shape Request",
-            icon="TRIA_DOWN" if state.show_shape else "TRIA_RIGHT",
-            emboss=False,
-        )
-        if not state.show_shape:
-            return
-
         backend_row = panel.row(align=True)
         backend_row.prop(state, "launch_backend", expand=True)
         selected_service = _selected_3d_service_key(state)
@@ -6643,16 +8227,6 @@ class NYMPHSV2_PT_texture(bpy.types.Panel):
         layout = self.layout
         panel = layout.box()
 
-        panel.prop(
-            state,
-            "show_texture",
-            text="Texture Request",
-            icon="TRIA_DOWN" if state.show_texture else "TRIA_RIGHT",
-            emboss=False,
-        )
-        if not state.show_texture:
-            return
-
         backend_row = panel.row(align=True)
         backend_row.prop(state, "texture_backend", expand=True)
         selected_service = _selected_texture_service_key(state)
@@ -6755,6 +8329,7 @@ class NYMPHSV2_PT_texture(bpy.types.Panel):
 
 
 CLASSES = (
+    NymphsPartPlanItem,
     NymphsV2State,
     NYMPHSV2_OT_probe_backend,
     NYMPHSV2_OT_probe_gpu,
@@ -6766,6 +8341,9 @@ CLASSES = (
     NYMPHSV2_OT_run_texture_request,
     NYMPHSV2_OT_generate_image,
     NYMPHSV2_OT_generate_mv_set,
+    NYMPHSV2_OT_clear_managed_prompt_presets,
+    NYMPHSV2_OT_insert_saved_prompt,
+    NYMPHSV2_OT_save_current_prompt,
     NYMPHSV2_OT_load_prompt_preset,
     NYMPHSV2_OT_load_imagegen_settings_preset,
     NYMPHSV2_OT_save_imagegen_settings_preset,
@@ -6787,8 +8365,15 @@ CLASSES = (
     NYMPHSV2_OT_open_image_prompt_text_block,
     NYMPHSV2_OT_pull_image_prompt_text_block,
     NYMPHSV2_OT_edit_image_prompts,
+    NYMPHSV2_OT_preview_image_prompt,
     NYMPHSV2_OT_pick_gemini_guide_image,
     NYMPHSV2_OT_clear_gemini_guide_image,
+    NYMPHSV2_OT_pick_part_master_image,
+    NYMPHSV2_OT_use_current_image_as_part_master,
+    NYMPHSV2_OT_use_last_generated_as_part_master,
+    NYMPHSV2_OT_plan_character_parts,
+    NYMPHSV2_OT_extract_character_parts,
+    NYMPHSV2_OT_clear_character_part_plan,
     NYMPHSV2_OT_open_imagegen_folder,
     NYMPHSV2_OT_clear_imagegen_folder,
     NYMPHSV2_OT_open_shape_folder,

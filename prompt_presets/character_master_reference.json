@@ -1,0 +1,5 @@
+{
+  "name": "Character Master Reference",
+  "description": "Full-character master image for guided part extraction",
+  "prompt": "Create one complete master character reference image from the character description below. Show the full character as one cohesive design, centered, head to toe visible, front-readable, with the complete outfit, hair, facial hair, weapons, accessories, and carried props included together. Use a clean plain light background, soft even lighting, readable silhouette, clear materials, and enough space around the character. This image will be used as the canonical source for later guided part extraction, so keep the design consistent and complete. Critical exclusions: do not make a parts sheet, grid, collage, lineup, turnaround, catalog page, or separate item layout. Do not split the clothing, hair, weapons, or props into separate images. Do not add labels, text, scenery, extra characters, duplicate versions, or extra floating items. Character description:"
+}

@@ -1,5 +1,5 @@
 {
   "name": "Character Asset",
   "description": "Readable full-character prompt for image-to-3D workflows",
-  "prompt": "single original character concept, full body, centered, head to toe visible, clean silhouette, simple plain light background, soft even lighting, readable costume design, clear limb separation, appealing stylized proportions, no scenery, no props crossing the body, high quality game character concept art"
+  "prompt": "single original character reference, full body, centered, head to toe visible, clean silhouette, simple plain light background, soft even lighting, readable costume design, clear limb separation, appealing proportions, no scenery, no props crossing the body, designed for 3D modeling reference"
 }

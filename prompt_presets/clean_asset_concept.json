@@ -1,5 +1,5 @@
 {
-  "name": "Clean Asset Concept",
+  "name": "Clean Asset Reference",
   "description": "General-purpose asset prompt for props, creatures, buildings, and objects",
-  "prompt": "single game asset concept, centered subject, isolated on a plain light background, clean readable silhouette, whole subject visible, consistent design, soft even lighting, minimal shadows, no scenery, no text, high quality concept art, clear shape language, designed for 3D modeling reference"
+  "prompt": "single game asset reference, centered subject, isolated on a plain light background, clean readable silhouette, whole subject visible, consistent design, soft even lighting, minimal shadows, no scenery, no text, clear shape language, designed for 3D modeling reference"
 }
