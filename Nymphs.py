@@ -5,7 +5,7 @@ Live Blender addon implementation for Nymphs.
 bl_info = {
     "name": "Nymphs",
     "author": "Nymphs3D",
-    "version": (1, 1, 116),
+    "version": (1, 1, 117),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Nymphs",
     "description": "Blender client for NymphsCore image, shape, and texture backends",
@@ -94,6 +94,8 @@ GEMINI_IMAGE_SIZE_MODELS = {
 DEFAULT_IMAGEGEN_PROMPT_PRESET = "clean_asset_concept"
 DEFAULT_IMAGEGEN_PROMPT_TEXT_NAME = "Nymphs Image Prompt"
 PACKAGED_IMAGEGEN_PROMPT_PRESET_DIR = "prompt_presets"
+DEFAULT_IMAGEGEN_STYLE_PRESET = "__none__"
+PACKAGED_IMAGEGEN_STYLE_PRESET_DIR = "style_presets"
 WSL_DISTRO_ITEMS = []
 N2D2_PRESET_SYNC_GUARD = False
 N2D2_AUTORESTART_GUARD = False
@@ -145,12 +147,14 @@ IMAGEGEN_PROMPT_PRESETS = {
             "Hair must be generated as its own separate standalone image, never attached to the anatomy base body. "
             "Every other generated image should be exactly one isolated character part: one hairstyle or hair asset, "
             "one clothing garment, one armor piece, one accessory, one weapon, or one carried object from the same character design. "
-            "If multiple images or variants are requested, make each image a different single item, starting with "
-            "the anatomy base body, then hair as its own separate image, then separate wearable or carried items. "
+            "Return a full breakout set as multiple separate images in one request, generating as many images as needed "
+            "to cover the anatomy base body, hair, and each major wearable or carried item from the design. "
+            "Start with the anatomy base body, then hair, then remaining items. "
             "For the anatomy base body, keep it neutral, front-readable, uncluttered, and appropriate as a base mesh game asset reference. "
             "For hair, clothing, armor, accessories, weapons, and props, show only the item itself, centered, complete, "
             "unobstructed, and not worn by a person or mannequin. "
             "Do not combine the anatomy base body with hair, clothing, or props in the same image. "
+            "Never place more than one item in the same image. "
             "Use a plain light background, soft even studio lighting, clean readable silhouette, clear materials, "
             "and game asset concept art styling suitable for 3D modeling reference. "
             "No duplicate items, no text, no labels, no scenery. "
@@ -220,6 +224,75 @@ def _load_packaged_imagegen_prompt_presets():
 
 
 IMAGEGEN_PROMPT_PRESETS.update(_load_packaged_imagegen_prompt_presets())
+IMAGEGEN_STYLE_PRESETS = {
+    "painterly_fantasy": {
+        "label": "Painterly Fantasy",
+        "description": "Painterly fantasy concept art with rich costume detail",
+        "style": (
+            "painterly fantasy concept art, elegant linework, soft watercolor shading, readable silhouette, "
+            "ornate costume detail, handcrafted illustration finish"
+        ),
+    },
+    "clean_anime": {
+        "label": "Clean Anime",
+        "description": "Polished anime key art with crisp cel shading",
+        "style": (
+            "clean anime illustration, crisp linework, cel-shaded rendering, polished key art finish, "
+            "controlled highlights, appealing stylized proportions"
+        ),
+    },
+    "grimdark_realism": {
+        "label": "Grimdark Realism",
+        "description": "Grounded dark-fantasy realism with worn materials",
+        "style": (
+            "grimdark fantasy realism, grounded material rendering, worn surfaces, moody natural palette, "
+            "cinematic concept art finish"
+        ),
+    },
+    "storybook_inkwash": {
+        "label": "Storybook Inkwash",
+        "description": "Soft storybook illustration with watercolor and ink",
+        "style": (
+            "storybook illustration, graceful ink outlines, soft watercolor textures, gentle fantasy palette, "
+            "hand-painted illustrative finish"
+        ),
+    },
+}
+
+
+def _packaged_imagegen_style_preset_dir():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), PACKAGED_IMAGEGEN_STYLE_PRESET_DIR)
+
+
+def _load_packaged_imagegen_style_presets():
+    preset_dir = _packaged_imagegen_style_preset_dir()
+    presets = {}
+    if not os.path.isdir(preset_dir):
+        return presets
+    for filename in sorted(os.listdir(preset_dir)):
+        if not filename.lower().endswith(".json"):
+            continue
+        key = os.path.splitext(filename)[0]
+        path = os.path.join(preset_dir, filename)
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except Exception:
+            continue
+        label = str(data.get("name") or data.get("label") or key.replace("_", " ").title()).strip()
+        description = str(data.get("description") or f"Packaged style preset: {filename}").strip()
+        style = str(data.get("style") or data.get("prompt") or "").strip()
+        if not style:
+            continue
+        presets[key] = {
+            "label": label,
+            "description": description,
+            "style": style,
+        }
+    return presets
+
+
+IMAGEGEN_STYLE_PRESETS.update(_load_packaged_imagegen_style_presets())
 IMAGEGEN_PROMPT_PRESET_ITEMS = tuple(
     (key, data["label"], data["description"]) for key, data in IMAGEGEN_PROMPT_PRESETS.items()
 )
@@ -967,6 +1040,141 @@ def _sync_imagegen_prompt_preset(state):
     return key
 
 
+def _imagegen_style_preset_dir():
+    return bpy.utils.user_resource(
+        "CONFIG",
+        path=os.path.join("nymphs", "image_style_presets"),
+        create=True,
+    )
+
+
+def _imagegen_style_preset_slug(name):
+    slug = re.sub(r"[^a-z0-9]+", "_", (name or "").strip().lower()).strip("_")
+    return slug or "style_preset"
+
+
+def _imagegen_style_preset_file(key):
+    return os.path.join(_imagegen_style_preset_dir(), f"{_imagegen_style_preset_slug(key)}.json")
+
+
+def _seed_imagegen_style_presets():
+    try:
+        preset_dir = _imagegen_style_preset_dir()
+    except Exception:
+        return
+    marker = os.path.join(preset_dir, ".defaults_seeded")
+    if os.path.exists(marker):
+        return
+    for key, data in IMAGEGEN_STYLE_PRESETS.items():
+        path = _imagegen_style_preset_file(key)
+        if os.path.exists(path):
+            continue
+        payload = {
+            "name": data["label"],
+            "description": data["description"],
+            "style": data["style"],
+        }
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.write("\n")
+    with open(marker, "w", encoding="utf-8") as handle:
+        handle.write("Defaults seeded.\n")
+
+
+def _load_imagegen_style_presets():
+    preset_dir = _imagegen_style_preset_dir()
+
+    def _load():
+        presets = {
+            key: {
+                "label": data["label"],
+                "description": data["description"],
+                "style": data["style"],
+            }
+            for key, data in IMAGEGEN_STYLE_PRESETS.items()
+        }
+        try:
+            _seed_imagegen_style_presets()
+            for filename in sorted(os.listdir(preset_dir)):
+                if not filename.lower().endswith(".json"):
+                    continue
+                key = os.path.splitext(filename)[0]
+                if key in IMAGEGEN_STYLE_PRESETS:
+                    continue
+                path = os.path.join(preset_dir, filename)
+                try:
+                    with open(path, "r", encoding="utf-8") as handle:
+                        data = json.load(handle)
+                except Exception:
+                    continue
+                name = str(data.get("name") or key.replace("_", " ").title()).strip()
+                style = str(data.get("style") or data.get("prompt") or "").strip()
+                if not style:
+                    continue
+                presets[key] = {
+                    "label": name,
+                    "description": str(data.get("description") or f"Style preset file: {filename}").strip(),
+                    "style": style,
+                }
+        except Exception:
+            pass
+        return presets
+
+    return _transient_cached("imagegen_style_presets", preset_dir, PRESET_CACHE_TTL_SECONDS, _load)
+
+
+def _imagegen_style_preset_data(preset_key):
+    presets = _load_imagegen_style_presets()
+    resolved_key = (preset_key or "").strip()
+    if resolved_key in presets:
+        return presets[resolved_key]
+    return {"label": "No Style", "style": ""}
+
+
+def _imagegen_style_preset_items(self, context):
+    presets = _load_imagegen_style_presets()
+    items = [(DEFAULT_IMAGEGEN_STYLE_PRESET, "No Style", "Don't inject a reusable style fragment")]
+    items.extend((key, data["label"], data["description"]) for key, data in presets.items())
+    return tuple(items)
+
+
+def _resolve_imagegen_style_preset_key(preset_key):
+    presets = _load_imagegen_style_presets()
+    resolved_key = (preset_key or "").strip()
+    if resolved_key == DEFAULT_IMAGEGEN_STYLE_PRESET:
+        return DEFAULT_IMAGEGEN_STYLE_PRESET
+    if resolved_key in presets:
+        return resolved_key
+    return DEFAULT_IMAGEGEN_STYLE_PRESET
+
+
+def _sync_imagegen_style_preset(state):
+    key = _resolve_imagegen_style_preset_key(getattr(state, "imagegen_style_preset", ""))
+    try:
+        if getattr(state, "imagegen_style_preset", "") != key:
+            state.imagegen_style_preset = key
+    except Exception:
+        pass
+    return key
+
+
+def _compose_imagegen_prompt(prompt_text, style_text):
+    prompt = (prompt_text or "").strip()
+    style = (style_text or "").strip()
+    if not style:
+        return prompt
+    style_sentence = f"Visual style: {style.rstrip().rstrip('.')}. "
+    marker = "Character description:"
+    if marker in prompt:
+        before, after = prompt.rsplit(marker, 1)
+        return f"{before.rstrip()} {style_sentence}{marker}{after}"
+    return f"{prompt.rstrip()} {style_sentence}".strip()
+
+
+def _resolved_imagegen_prompt(state):
+    return _compose_imagegen_prompt(getattr(state, "imagegen_prompt", ""), getattr(state, "imagegen_style", ""))
+
+
 def _imagegen_settings_preset_dir():
     return bpy.utils.user_resource(
         "CONFIG",
@@ -1502,7 +1710,7 @@ def _blender_path_is_file(state, raw_path):
 
 
 def _build_imagegen_payload(state):
-    prompt = state.imagegen_prompt.strip()
+    prompt = _resolved_imagegen_prompt(state)
     return _build_imagegen_payload_for_prompt(state, prompt=prompt)
 
 
@@ -1524,7 +1732,7 @@ def _build_imagegen_payload_for_prompt(state, *, prompt, seed=None):
 
 
 def _build_mv_prompt(state, view_phrase):
-    base_prompt = state.imagegen_prompt.strip()
+    base_prompt = _resolved_imagegen_prompt(state)
     if not base_prompt:
         raise RuntimeError("Enter an image-generation prompt first.")
     prompt_parts = [
@@ -1674,6 +1882,18 @@ def _character_part_breakout_variant_prompts(base_prompt, variant_count):
                 "Do not include a full character, no second item, no side-by-side layout."
             )
     return [f"{base_prompt.rstrip()}\n\n{instruction}" for instruction in instructions]
+
+
+def _character_part_breakout_auto_prompt(base_prompt):
+    return (
+        f"{base_prompt.rstrip()}\n\n"
+        "Request mode: automatic breakout set. "
+        "Return the full character breakout as multiple separate images in one response. "
+        "Generate as many images as needed to cover the anatomy base body, hair, and each major wearable or carried item. "
+        "Start with the anatomy base body, then hair, then the remaining items. "
+        "Exactly one centered subject per image. "
+        "No side-by-side layouts, no combined items, no full character plus prop in the same image."
+    )
 
 
 def _decode_image_data_url(data_url):
@@ -4332,6 +4552,17 @@ class NymphsV2State(bpy.types.PropertyGroup):
         description="Load a reusable prompt. Image settings stay unchanged.",
         items=_imagegen_prompt_preset_items,
     )
+    imagegen_style: StringProperty(
+        name="Style",
+        description="Optional reusable art-direction fragment that gets injected into the generated prompt without replacing your main description.",
+        default="",
+    )
+    imagegen_style_preset: EnumProperty(
+        name="Styles",
+        description="Pick a reusable style fragment to inject into the generated prompt.",
+        items=_imagegen_style_preset_items,
+        default=DEFAULT_IMAGEGEN_STYLE_PRESET,
+    )
     imagegen_settings_preset: EnumProperty(
         name="Generation Profile",
         description="Load a reusable Z-Image profile. Built-in profiles can switch Nunchaku rank, image size, steps, and variants.",
@@ -4921,19 +5152,21 @@ class NYMPHSV2_OT_generate_image(bpy.types.Operator):
             return {"CANCELLED"}
 
         backend = getattr(state, "imagegen_backend", "Z_IMAGE")
+        breakout_auto_mode = False
         try:
             variant_count = max(1, int(getattr(state, "imagegen_variant_count", 1)))
             assign_first_output = False
             if backend == "GEMINI":
                 _require_network_access(OPENROUTER_API_ROOT)
-                prompt = (state.imagegen_prompt or "").strip()
+                prompt = _resolved_imagegen_prompt(state)
                 if not prompt:
                     raise RuntimeError("Enter an image-generation prompt first.")
                 snapshot = _gemini_snapshot(state)
                 preset_key = _sync_imagegen_prompt_preset(state)
                 if preset_key == "character_part_breakout":
-                    payload = _character_part_breakout_variant_prompts(prompt, variant_count)
-                    assign_first_output = variant_count > 1
+                    payload = [_character_part_breakout_auto_prompt(prompt)]
+                    assign_first_output = True
+                    breakout_auto_mode = True
                 else:
                     payload = [prompt for _index in range(variant_count)]
                 worker_target = _gemini_imagegen_worker
@@ -4946,7 +5179,7 @@ class NYMPHSV2_OT_generate_image(bpy.types.Operator):
                 seed_step = max(1, int(getattr(state, "imagegen_seed_step", 1)))
                 preset_key = _sync_imagegen_prompt_preset(state)
                 if preset_key == "character_part_breakout":
-                    prompt_sequence = _character_part_breakout_variant_prompts((state.imagegen_prompt or "").strip(), variant_count)
+                    prompt_sequence = _character_part_breakout_variant_prompts(_resolved_imagegen_prompt(state), variant_count)
                     if variant_count > 1:
                         base_seed, generated = _imagegen_seed_value(state)
                         payload = [
@@ -4964,9 +5197,7 @@ class NYMPHSV2_OT_generate_image(bpy.types.Operator):
                     assign_first_output = variant_count > 1
                 elif variant_count > 1:
                     base_seed, generated = _imagegen_seed_value(state)
-                    prompt_sequence = (
-                        [(state.imagegen_prompt or "").strip() for _ in range(variant_count)]
-                    )
+                    prompt_sequence = [_resolved_imagegen_prompt(state) for _ in range(variant_count)]
                     payload = [
                         _build_imagegen_payload_for_prompt(
                             state,
@@ -4990,7 +5221,12 @@ class NYMPHSV2_OT_generate_image(bpy.types.Operator):
         state.imagegen_started_at = time.time()
         image_backend_label = _current_image_backend_label(state)
         image_backend_detail = _current_image_backend_detail(state)
-        if variant_count > 1:
+        if breakout_auto_mode:
+            state.imagegen_status_text = f"Generating {image_backend_label} breakout set..."
+            state.imagegen_task_stage = "Generating Breakout Set"
+            state.imagegen_task_detail = image_backend_detail or "Requesting the full breakout set..."
+            state.imagegen_task_progress = ""
+        elif variant_count > 1:
             state.imagegen_status_text = f"Generating {variant_count} {image_backend_label} variants..."
             state.imagegen_task_stage = "Generating Variants"
             state.imagegen_task_detail = image_backend_detail or "Waiting for image backend progress..."
@@ -5257,6 +5493,113 @@ class NYMPHSV2_OT_open_prompt_presets_folder(bpy.types.Operator):
         except Exception as exc:
             self.report({"ERROR"}, f"Could not open presets folder: {exc}")
             return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class NYMPHSV2_OT_load_style_preset(bpy.types.Operator):
+    bl_idname = "nymphsv2.load_style_preset"
+    bl_label = "Load Style"
+    bl_description = "Load the selected style preset into the separate style field"
+
+    def execute(self, context):
+        state = context.scene.nymphs_state
+        preset = _imagegen_style_preset_data(_sync_imagegen_style_preset(state))
+        state.imagegen_style = preset.get("style", "")
+        state.imagegen_status_text = f"Loaded style: {preset.get('label', 'No Style')}"
+        _touch_ui()
+        return {"FINISHED"}
+
+
+class NYMPHSV2_OT_save_style_preset(bpy.types.Operator):
+    bl_idname = "nymphsv2.save_style_preset"
+    bl_label = "Save Style"
+    bl_description = "Save the current style fragment as an editable JSON preset"
+
+    name: StringProperty(
+        name="Style Name",
+        default="",
+    )
+
+    def invoke(self, context, event):
+        state = context.scene.nymphs_state
+        current = _imagegen_style_preset_data(_sync_imagegen_style_preset(state))
+        self.name = current.get("label", "") if current.get("style") else ""
+        return context.window_manager.invoke_props_dialog(self, width=420)
+
+    def execute(self, context):
+        state = context.scene.nymphs_state
+        name = (self.name or "").strip()
+        if not name:
+            self.report({"ERROR"}, "Enter a style name.")
+            return {"CANCELLED"}
+        style = (state.imagegen_style or "").strip()
+        if not style:
+            self.report({"ERROR"}, "Enter a style before saving a preset.")
+            return {"CANCELLED"}
+        key = _imagegen_style_preset_slug(name)
+        payload = {
+            "name": name,
+            "description": f"Saved from Blender on {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            "style": style,
+        }
+        with open(_imagegen_style_preset_file(key), "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.write("\n")
+        state.imagegen_style_preset = key
+        _sync_imagegen_style_preset(state)
+        state.imagegen_status_text = f"Saved style: {name}"
+        _touch_ui()
+        return {"FINISHED"}
+
+
+class NYMPHSV2_OT_delete_style_preset(bpy.types.Operator):
+    bl_idname = "nymphsv2.delete_style_preset"
+    bl_label = "Delete Style"
+    bl_description = "Delete the selected style preset JSON file"
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        state = context.scene.nymphs_state
+        key = (state.imagegen_style_preset or "").strip()
+        path = _imagegen_style_preset_file(key)
+        if not key or key == DEFAULT_IMAGEGEN_STYLE_PRESET or not os.path.exists(path):
+            self.report({"ERROR"}, "No style preset file is selected.")
+            return {"CANCELLED"}
+        os.remove(path)
+        state.imagegen_style_preset = DEFAULT_IMAGEGEN_STYLE_PRESET
+        _sync_imagegen_style_preset(state)
+        state.imagegen_status_text = "Deleted style preset."
+        _touch_ui()
+        return {"FINISHED"}
+
+
+class NYMPHSV2_OT_open_style_presets_folder(bpy.types.Operator):
+    bl_idname = "nymphsv2.open_style_presets_folder"
+    bl_label = "Open Folder"
+    bl_description = "Open the folder containing editable JSON style presets"
+
+    def execute(self, context):
+        _seed_imagegen_style_presets()
+        try:
+            bpy.ops.wm.path_open(filepath=_imagegen_style_preset_dir())
+        except Exception as exc:
+            self.report({"ERROR"}, f"Could not open style presets folder: {exc}")
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class NYMPHSV2_OT_clear_image_style_field(bpy.types.Operator):
+    bl_idname = "nymphsv2.clear_image_style_field"
+    bl_label = "Clear Style Field"
+    bl_description = "Clear the current style fragment without changing the main prompt"
+
+    def execute(self, context):
+        state = context.scene.nymphs_state
+        state.imagegen_style = ""
+        state.imagegen_status_text = "Cleared style fragment."
+        _touch_ui()
         return {"FINISHED"}
 
 
@@ -5790,6 +6133,20 @@ class NYMPHSV2_PT_image_generation(bpy.types.Panel):
         prompt_preset_tools.operator("nymphsv2.save_prompt_preset", text="Save")
         prompt_preset_tools.operator("nymphsv2.delete_prompt_preset", text="Delete")
         prompt_preset_tools.operator("nymphsv2.open_prompt_presets_folder", text="Open")
+
+        _sync_imagegen_style_preset(state)
+        style_preset_label_row = request.row(align=True)
+        style_preset_label_row.label(text="Style Preset")
+        style_preset_label_row.operator("nymphsv2.load_style_preset", text="Load")
+        style_preset_row = request.row(align=True)
+        style_preset_row.prop(state, "imagegen_style_preset", text="")
+        style_preset_tools = request.row(align=True)
+        style_preset_tools.operator("nymphsv2.save_style_preset", text="Save")
+        style_preset_tools.operator("nymphsv2.delete_style_preset", text="Delete")
+        style_preset_tools.operator("nymphsv2.open_style_presets_folder", text="Open")
+        style_row = request.row(align=True)
+        style_row.prop(state, "imagegen_style", text="Style")
+        style_row.operator("nymphsv2.clear_image_style_field", text="Clear")
 
         prompt_row = request.row(align=True)
         prompt_row.label(text="Prompt")
@@ -6418,6 +6775,11 @@ CLASSES = (
     NYMPHSV2_OT_save_prompt_preset,
     NYMPHSV2_OT_delete_prompt_preset,
     NYMPHSV2_OT_open_prompt_presets_folder,
+    NYMPHSV2_OT_load_style_preset,
+    NYMPHSV2_OT_save_style_preset,
+    NYMPHSV2_OT_delete_style_preset,
+    NYMPHSV2_OT_open_style_presets_folder,
+    NYMPHSV2_OT_clear_image_style_field,
     NYMPHSV2_OT_load_trellis_shape_preset,
     NYMPHSV2_OT_save_trellis_shape_preset,
     NYMPHSV2_OT_delete_trellis_shape_preset,
