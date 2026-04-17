@@ -5,7 +5,7 @@ Live Blender addon implementation for Nymphs.
 bl_info = {
     "name": "Nymphs",
     "author": "Nymphs3D",
-    "version": (1, 1, 112),
+    "version": (1, 1, 114),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Nymphs",
     "description": "Blender client for NymphsCore image, shape, and texture backends",
@@ -133,21 +133,22 @@ IMAGEGEN_PROMPT_PRESETS = {
     },
     "character_part_breakout": {
         "label": "Character Part Breakout",
-        "description": "Generates separate body, clothing, weapon, and prop reference images from a character description",
+        "description": "Generates separate body, hair, clothing, weapon, and prop reference images from a character description",
         "prompt": (
             "Create separate standalone asset reference images from the character description below. "
             "Do not make a parts sheet, lineup, grid, collage, catalog page, or multi-item layout. "
             "Each generated image must contain exactly one thing from the character design. "
             "One image should be the complete uncensored nude base character body in a neutral A-pose or T-pose, "
-            "centered, head-to-toe visible, with no clothing, armor, accessories, weapons, censor bars, black bars, "
+            "centered, head-to-toe visible, with no clothing, armor, accessories, weapons, hair, censor bars, black bars, "
             "blur, stickers, or coverings. "
-            "Every other generated image should be exactly one isolated character part: one clothing garment, "
-            "one armor piece, one accessory, one weapon, or one carried object from the same character design. "
+            "Hair must be generated as its own separate standalone image, never attached to the nude base body. "
+            "Every other generated image should be exactly one isolated character part: one hairstyle or hair asset, "
+            "one clothing garment, one armor piece, one accessory, one weapon, or one carried object from the same character design. "
             "If multiple images or variants are requested, make each image a different single item, starting with "
-            "the nude base body and then separate wearable or carried items. "
-            "For clothing, armor, accessories, weapons, and props, show only the item itself, centered, complete, "
+            "the nude base body, then hair as its own separate image, then separate wearable or carried items. "
+            "For hair, clothing, armor, accessories, weapons, and props, show only the item itself, centered, complete, "
             "unobstructed, and not worn by a person or mannequin. "
-            "Do not combine the nude body with clothing or props in the same image. "
+            "Do not combine the nude body with hair, clothing, or props in the same image. "
             "Use a plain light background, soft even studio lighting, clean readable silhouette, clear materials, "
             "and game asset concept art styling suitable for 3D modeling reference. "
             "No duplicate items, no text, no labels, no scenery. "
@@ -1590,6 +1591,28 @@ def _gemini_safe_response_for_metadata(detail):
     return safe_detail
 
 
+def _character_part_breakout_variant_prompts(base_prompt, variant_count):
+    instructions = []
+    for index in range(max(1, variant_count)):
+        if index == 0:
+            instructions.append(
+                "Request target: render only the nude base body in a neutral A-pose or T-pose. "
+                "No hair, no clothing, no accessories, no weapons, no props."
+            )
+        elif index == 1:
+            instructions.append(
+                "Request target: render only the hair or hairstyle asset from the character design. "
+                "No head, no face, no body, no mannequin, no clothing, no accessories."
+            )
+        else:
+            instructions.append(
+                "Request target: render only one different remaining item from the character design that has "
+                "not been depicted yet. Prioritize clothing, armor pieces, accessories, weapons, and carried props. "
+                "Do not render the body. Do not render hair unless hair is the chosen target."
+            )
+    return [f"{base_prompt.rstrip()}\n\n{instruction}" for instruction in instructions]
+
+
 def _decode_image_data_url(data_url):
     value = (data_url or "").strip()
     if not value:
@@ -1666,27 +1689,33 @@ def _gemini_request_image(snapshot, prompt, output_label):
             message += f" Response: {' '.join(text_parts)[:500]}"
         raise RuntimeError(message)
 
-    mime_type, image_bytes = _decode_image_data_url(image_urls[0])
+    saved_outputs = []
+    total_images = len(image_urls)
+    for image_index, image_url in enumerate(image_urls, start=1):
+        mime_type, image_bytes = _decode_image_data_url(image_url)
+        item_label = output_label if total_images == 1 else f"{output_label}-{image_index}"
+        output_path = _imagegen_output_path(item_label, _gemini_image_suffix(mime_type))
+        with open(output_path, "wb") as handle:
+            handle.write(image_bytes)
 
-    output_path = _imagegen_output_path(output_label, _gemini_image_suffix(mime_type))
-    with open(output_path, "wb") as handle:
-        handle.write(image_bytes)
+        metadata = {
+            "provider": "gemini",
+            "model": model_id,
+            "prompt": prompt,
+            "aspect_ratio": snapshot.get("aspect_ratio") or "1:1",
+            "image_size": snapshot.get("image_size") or "",
+            "mime_type": mime_type,
+            "image_index": image_index,
+            "image_count": total_images,
+            "text": [part for part in text_parts if part],
+            "response": _gemini_safe_response_for_metadata(detail),
+        }
+        metadata_path = os.path.splitext(output_path)[0] + ".json"
+        with open(metadata_path, "w", encoding="utf-8") as handle:
+            json.dump(metadata, handle, indent=2)
+        saved_outputs.append((output_path, metadata_path))
 
-    metadata = {
-        "provider": "gemini",
-        "model": model_id,
-        "prompt": prompt,
-        "aspect_ratio": snapshot.get("aspect_ratio") or "1:1",
-        "image_size": snapshot.get("image_size") or "",
-        "mime_type": mime_type,
-        "text": [part for part in text_parts if part],
-        "response": _gemini_safe_response_for_metadata(detail),
-    }
-    metadata_path = os.path.splitext(output_path)[0] + ".json"
-    with open(metadata_path, "w", encoding="utf-8") as handle:
-        json.dump(metadata, handle, indent=2)
-
-    return output_path, metadata_path
+    return saved_outputs
 
 
 def _export_selected_mesh_file(context, export_format="glb", destination_path=""):
@@ -3378,10 +3407,12 @@ def _job_worker(scene_name, api_root, payload, source_object_name):
         )
 
 
-def _imagegen_worker(scene_name, api_root, payload):
+def _imagegen_worker(scene_name, api_root, payload, assign_first_output=False):
     try:
         payloads = list(payload) if isinstance(payload, (list, tuple)) else [payload]
         total = len(payloads)
+        first_output_path = ""
+        first_metadata_path = ""
         last_output_path = ""
         last_metadata_path = ""
         output_dir = ""
@@ -3413,13 +3444,22 @@ def _imagegen_worker(scene_name, api_root, payload):
             state = _active_state(scene_name)
             blender_output_path = _to_blender_accessible_path(state, output_path)
             blender_metadata_path = _to_blender_accessible_path(state, metadata_path)
+            if not first_output_path:
+                first_output_path = blender_output_path
+                first_metadata_path = blender_metadata_path
             last_output_path = blender_output_path
             last_metadata_path = blender_metadata_path
             output_dir = os.path.dirname(blender_output_path) if blender_output_path else output_dir
 
+        assigned_output_path = first_output_path if assign_first_output and first_output_path else last_output_path
+        assigned_metadata_path = first_metadata_path if assign_first_output and first_metadata_path else last_metadata_path
         final_status = "Image generated and assigned to Image."
         if total > 1:
-            final_status = f"Generated {total} image variants. Last variant assigned to Image."
+            final_status = (
+                f"Generated {total} image variants. First breakout image assigned to Image."
+                if assign_first_output
+                else f"Generated {total} image variants. Last variant assigned to Image."
+            )
 
         _emit_status(
             scene_name,
@@ -3430,10 +3470,10 @@ def _imagegen_worker(scene_name, api_root, payload):
             imagegen_task_stage="",
             imagegen_task_detail="",
             imagegen_task_progress="",
-            imagegen_output_path=last_output_path,
+            imagegen_output_path=assigned_output_path,
             imagegen_output_dir=output_dir,
-            imagegen_metadata_path=last_metadata_path,
-            image_path=last_output_path,
+            imagegen_metadata_path=assigned_metadata_path,
+            image_path=assigned_output_path,
         )
     except Exception as exc:
         _emit_status(
@@ -3448,10 +3488,13 @@ def _imagegen_worker(scene_name, api_root, payload):
         )
 
 
-def _gemini_imagegen_worker(scene_name, snapshot, prompts):
+def _gemini_imagegen_worker(scene_name, snapshot, prompts, assign_first_output=False):
     try:
         prompts = list(prompts) if isinstance(prompts, (list, tuple)) else [prompts]
         total = len(prompts)
+        generated_images = 0
+        first_output_path = ""
+        first_metadata_path = ""
         last_output_path = ""
         last_metadata_path = ""
         output_dir = ""
@@ -3468,14 +3511,25 @@ def _gemini_imagegen_worker(scene_name, snapshot, prompts):
                 imagegen_task_progress=progress,
                 imagegen_status_text=detail,
             )
-            output_path, metadata_path = _gemini_request_image(snapshot, prompt, f"gemini-{index}")
-            last_output_path = output_path
-            last_metadata_path = metadata_path
-            output_dir = os.path.dirname(output_path)
+            saved_outputs = _gemini_request_image(snapshot, prompt, f"gemini-{index}")
+            for output_path, metadata_path in saved_outputs:
+                generated_images += 1
+                if not first_output_path:
+                    first_output_path = output_path
+                    first_metadata_path = metadata_path
+                last_output_path = output_path
+                last_metadata_path = metadata_path
+                output_dir = os.path.dirname(output_path)
 
+        assigned_output_path = first_output_path if assign_first_output and first_output_path else last_output_path
+        assigned_metadata_path = first_metadata_path if assign_first_output and first_metadata_path else last_metadata_path
         final_status = "Gemini image generated and assigned to Image."
-        if total > 1:
-            final_status = f"Generated {total} Gemini image variants. Last variant assigned to Image."
+        if generated_images > 1:
+            final_status = (
+                f"Generated {generated_images} Gemini images. First breakout image assigned to Image."
+                if assign_first_output
+                else f"Generated {generated_images} Gemini images. Last image assigned to Image."
+            )
         _emit_status(
             scene_name,
             imagegen_is_busy=False,
@@ -3485,10 +3539,10 @@ def _gemini_imagegen_worker(scene_name, snapshot, prompts):
             imagegen_task_stage="",
             imagegen_task_detail="",
             imagegen_task_progress="",
-            imagegen_output_path=last_output_path,
+            imagegen_output_path=assigned_output_path,
             imagegen_output_dir=output_dir,
-            imagegen_metadata_path=last_metadata_path,
-            image_path=last_output_path,
+            imagegen_metadata_path=assigned_metadata_path,
+            image_path=assigned_output_path,
         )
     except Exception as exc:
         _emit_status(
@@ -4727,27 +4781,40 @@ class NYMPHSV2_OT_generate_image(bpy.types.Operator):
         backend = getattr(state, "imagegen_backend", "Z_IMAGE")
         try:
             variant_count = max(1, int(getattr(state, "imagegen_variant_count", 1)))
+            assign_first_output = False
             if backend == "GEMINI":
                 _require_network_access(OPENROUTER_API_ROOT)
                 prompt = (state.imagegen_prompt or "").strip()
                 if not prompt:
                     raise RuntimeError("Enter an image-generation prompt first.")
                 snapshot = _gemini_snapshot(state)
-                payload = [prompt for _index in range(variant_count)]
+                preset_key = _sync_imagegen_prompt_preset(state)
+                if preset_key == "character_part_breakout" and variant_count > 1:
+                    payload = _character_part_breakout_variant_prompts(prompt, variant_count)
+                    assign_first_output = True
+                else:
+                    payload = [prompt for _index in range(variant_count)]
                 worker_target = _gemini_imagegen_worker
-                worker_args = (context.scene.name, snapshot, payload)
+                worker_args = (context.scene.name, snapshot, payload, assign_first_output)
                 generated = False
                 base_seed = None
             else:
                 api_root = _normalize_api_root(_service_api_root(state, "n2d2"))
                 _require_network_access(api_root)
                 seed_step = max(1, int(getattr(state, "imagegen_seed_step", 1)))
+                preset_key = _sync_imagegen_prompt_preset(state)
                 if variant_count > 1:
                     base_seed, generated = _imagegen_seed_value(state)
+                    prompt_sequence = (
+                        _character_part_breakout_variant_prompts((state.imagegen_prompt or "").strip(), variant_count)
+                        if preset_key == "character_part_breakout"
+                        else [(state.imagegen_prompt or "").strip() for _ in range(variant_count)]
+                    )
+                    assign_first_output = preset_key == "character_part_breakout"
                     payload = [
                         _build_imagegen_payload_for_prompt(
                             state,
-                            prompt=(state.imagegen_prompt or "").strip(),
+                            prompt=prompt_sequence[index],
                             seed=base_seed + (index * seed_step),
                         )
                         for index in range(variant_count)
@@ -4757,7 +4824,7 @@ class NYMPHSV2_OT_generate_image(bpy.types.Operator):
                     generated = False
                     base_seed = None
                 worker_target = _imagegen_worker
-                worker_args = (context.scene.name, api_root, payload)
+                worker_args = (context.scene.name, api_root, payload, assign_first_output)
         except Exception as exc:
             state.imagegen_status_text = str(exc)
             self.report({"ERROR"}, str(exc))
