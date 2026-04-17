@@ -5,7 +5,7 @@ Live Blender addon implementation for Nymphs.
 bl_info = {
     "name": "Nymphs",
     "author": "Nymphs3D",
-    "version": (1, 1, 115),
+    "version": (1, 1, 116),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Nymphs",
     "description": "Blender client for NymphsCore image, shape, and texture backends",
@@ -1656,18 +1656,22 @@ def _character_part_breakout_variant_prompts(base_prompt, variant_count):
             instructions.append(
                 "Request target: render only the neutral anatomy base body in a clean A-pose or T-pose for a game asset base mesh reference. "
                 "Use simplified non-explicit anatomy. "
-                "No hair, no clothing, no accessories, no weapons, no props."
+                "Exactly one centered subject only. "
+                "No second character, no clothing, no accessories, no weapons, no props, no staff, no separate items, no side-by-side layout."
             )
         elif index == 1:
             instructions.append(
                 "Request target: render only the hair or hairstyle asset from the character design. "
-                "No head, no face, no body, no mannequin, no clothing, no accessories."
+                "Exactly one centered subject only. "
+                "No head, no face, no body, no mannequin, no clothing, no accessories, no second item, no side-by-side layout."
             )
         else:
             instructions.append(
                 "Request target: render only one different remaining item from the character design that has "
                 "not been depicted yet. Prioritize clothing, armor pieces, accessories, weapons, and carried props. "
-                "Do not render the body. Do not render hair unless hair is the chosen target."
+                "Exactly one centered subject only. "
+                "Do not render the body. Do not render hair unless hair is the chosen target. "
+                "Do not include a full character, no second item, no side-by-side layout."
             )
     return [f"{base_prompt.rstrip()}\n\n{instruction}" for instruction in instructions]
 
@@ -4927,9 +4931,9 @@ class NYMPHSV2_OT_generate_image(bpy.types.Operator):
                     raise RuntimeError("Enter an image-generation prompt first.")
                 snapshot = _gemini_snapshot(state)
                 preset_key = _sync_imagegen_prompt_preset(state)
-                if preset_key == "character_part_breakout" and variant_count > 1:
+                if preset_key == "character_part_breakout":
                     payload = _character_part_breakout_variant_prompts(prompt, variant_count)
-                    assign_first_output = True
+                    assign_first_output = variant_count > 1
                 else:
                     payload = [prompt for _index in range(variant_count)]
                 worker_target = _gemini_imagegen_worker
@@ -4941,14 +4945,28 @@ class NYMPHSV2_OT_generate_image(bpy.types.Operator):
                 _require_network_access(api_root)
                 seed_step = max(1, int(getattr(state, "imagegen_seed_step", 1)))
                 preset_key = _sync_imagegen_prompt_preset(state)
-                if variant_count > 1:
+                if preset_key == "character_part_breakout":
+                    prompt_sequence = _character_part_breakout_variant_prompts((state.imagegen_prompt or "").strip(), variant_count)
+                    if variant_count > 1:
+                        base_seed, generated = _imagegen_seed_value(state)
+                        payload = [
+                            _build_imagegen_payload_for_prompt(
+                                state,
+                                prompt=prompt_sequence[index],
+                                seed=base_seed + (index * seed_step),
+                            )
+                            for index in range(variant_count)
+                        ]
+                    else:
+                        payload = _build_imagegen_payload_for_prompt(state, prompt=prompt_sequence[0])
+                        generated = False
+                        base_seed = None
+                    assign_first_output = variant_count > 1
+                elif variant_count > 1:
                     base_seed, generated = _imagegen_seed_value(state)
                     prompt_sequence = (
-                        _character_part_breakout_variant_prompts((state.imagegen_prompt or "").strip(), variant_count)
-                        if preset_key == "character_part_breakout"
-                        else [(state.imagegen_prompt or "").strip() for _ in range(variant_count)]
+                        [(state.imagegen_prompt or "").strip() for _ in range(variant_count)]
                     )
-                    assign_first_output = preset_key == "character_part_breakout"
                     payload = [
                         _build_imagegen_payload_for_prompt(
                             state,
