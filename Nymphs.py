@@ -5,7 +5,7 @@ Live Blender addon implementation for Nymphs.
 bl_info = {
     "name": "Nymphs",
     "author": "Nymphs3D",
-    "version": (1, 1, 142),
+    "version": (1, 1, 143),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Nymphs",
     "description": "Blender client for NymphsCore image, shape, and texture backends",
@@ -7594,7 +7594,7 @@ class NYMPHSV2_PT_image_generation(bpy.types.Panel):
         state = context.scene.nymphs_state
         layout = self.layout
 
-        panel = layout.box()
+        panel = layout.column(align=True)
         image_backend = getattr(state, "imagegen_backend", "Z_IMAGE")
         _draw_imagegen_status_box(panel, state)
 

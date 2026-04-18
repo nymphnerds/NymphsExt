@@ -15,7 +15,7 @@ Nymphs adds a Blender sidebar workflow for creating image references, generating
 4. Install `Nymphs`.
 5. Open the 3D View sidebar and use the `Nymphs` tabs.
 
-The current test package is `1.1.142`. The Blender extension id is `nymphs`.
+The current test package is `1.1.143`. The Blender extension id is `nymphs`.
 
 ## Workflow
 
