@@ -7626,7 +7626,10 @@ class NYMPHSV2_PT_image_generation(bpy.types.Panel):
                     warning = generation_box.box()
                     warning.label(text="Enable Blender online access to use Gemini.")
 
-                request = generation_box.box()
+                if image_backend == "Z_IMAGE":
+                    request = generation_box.box()
+                else:
+                    request = generation_box.column(align=True)
 
                 if image_backend == "Z_IMAGE":
                     settings_label_row = request.row(align=True)
@@ -7639,7 +7642,7 @@ class NYMPHSV2_PT_image_generation(bpy.types.Panel):
                     settings_preset_tools.operator("nymphsv2.delete_imagegen_settings_preset", text="Delete")
                     settings_preset_tools.operator("nymphsv2.open_imagegen_settings_presets_folder", text="Open")
                 else:
-                    gemini_box = request.box()
+                    gemini_box = request.column(align=True)
                     _ensure_openrouter_api_key_loaded(state)
                     gemini_model_row = gemini_box.split(factor=0.42, align=True)
                     gemini_model_row.label(text="Gemini Flash")
@@ -7649,7 +7652,7 @@ class NYMPHSV2_PT_image_generation(bpy.types.Panel):
                     gemini_row.prop(state, "gemini_aspect_ratio")
                     if _gemini_model_id(state) in GEMINI_IMAGE_SIZE_MODELS:
                         gemini_row.prop(state, "gemini_image_size")
-                    guide_box = gemini_box.box()
+                    guide_box = gemini_box.column(align=True)
                     guide_toggle_row = guide_box.row(align=True)
                     guide_toggle_row.prop(state, "gemini_use_guide_image")
                     if state.gemini_use_guide_image:
@@ -7660,7 +7663,7 @@ class NYMPHSV2_PT_image_generation(bpy.types.Panel):
                     if not (state.openrouter_api_key or os.environ.get("OPENROUTER_API_KEY")):
                         gemini_box.label(text="Uses OPENROUTER_API_KEY when the field is blank.")
 
-                prompts_box = request.box()
+                prompts_box = request.box() if image_backend == "Z_IMAGE" else request.column(align=True)
                 prompts_box.label(text="PROMPTS")
                 _sync_imagegen_prompt_preset(state, "imagegen_prompt_preset", PROMPT_KIND_SUBJECT)
                 _sync_imagegen_style_preset(state)
