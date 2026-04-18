@@ -1,0 +1,27 @@
+# Old IDE/editor state
+.idea/
+.vs/
+.fleet/
+.cursor/
+.cursor-server/
+.windsurf/
+.windsurf-server/
+.cline/
+.codeium/
+*.iml
+*.ipr
+*.iws
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Local OS noise
+.DS_Store
+Thumbs.db
+*:Zone.Identifier
+
+# Python cache
+__pycache__/
+*.pyc
+
