@@ -5,7 +5,7 @@ Live Blender addon implementation for Nymphs.
 bl_info = {
     "name": "Nymphs",
     "author": "Nymphs3D",
-    "version": (1, 1, 143),
+    "version": (1, 1, 144),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Nymphs",
     "description": "Blender client for NymphsCore image, shape, and texture backends",
@@ -7648,6 +7648,13 @@ class NYMPHSV2_PT_image_generation(bpy.types.Panel):
                     gemini_model_row.label(text="Gemini Flash")
                     gemini_model_row.prop(state, "gemini_model", text="")
                     gemini_box.prop(state, "openrouter_api_key", text="API")
+                    if not (state.openrouter_api_key or os.environ.get("OPENROUTER_API_KEY")):
+                        _draw_wrapped_lines(
+                            gemini_box,
+                            "Uses OPENROUTER_API_KEY when the field is blank.",
+                            width=48,
+                            max_lines=2,
+                        )
                     gemini_row = gemini_box.row(align=True)
                     gemini_row.prop(state, "gemini_aspect_ratio")
                     if _gemini_model_id(state) in GEMINI_IMAGE_SIZE_MODELS:
@@ -7660,8 +7667,6 @@ class NYMPHSV2_PT_image_generation(bpy.types.Panel):
                         guide_actions = guide_box.row(align=True)
                         guide_actions.operator("nymphsv2.pick_gemini_guide_image", text="Pick")
                         guide_actions.operator("nymphsv2.clear_gemini_guide_image", text="Clear")
-                    if not (state.openrouter_api_key or os.environ.get("OPENROUTER_API_KEY")):
-                        gemini_box.label(text="Uses OPENROUTER_API_KEY when the field is blank.")
 
                 prompts_box = request.box() if image_backend == "Z_IMAGE" else request.column(align=True)
                 prompts_box.label(text="PROMPTS")
@@ -8054,7 +8059,7 @@ class NYMPHSV2_PT_shape(bpy.types.Panel):
         state = context.scene.nymphs_state
         layout = self.layout
 
-        panel = layout.box()
+        panel = layout.column(align=True)
         backend_row = panel.row(align=True)
         backend_row.prop(state, "launch_backend", expand=True)
         selected_service = _selected_3d_service_key(state)
@@ -8228,7 +8233,7 @@ class NYMPHSV2_PT_texture(bpy.types.Panel):
     def draw(self, context):
         state = context.scene.nymphs_state
         layout = self.layout
-        panel = layout.box()
+        panel = layout.column(align=True)
 
         backend_row = panel.row(align=True)
         backend_row.prop(state, "texture_backend", expand=True)
