@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "nymphs"
-version = "1.1.144"
+version = "1.1.145"
 name = "Nymphs"
 tagline = "Blender client for NymphsCore image, shape, and texture backends"
 maintainer = "Babyjawz <babyjaws@gmail.com>"

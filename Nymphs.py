@@ -5,7 +5,7 @@ Live Blender addon implementation for Nymphs.
 bl_info = {
     "name": "Nymphs",
     "author": "Nymphs3D",
-    "version": (1, 1, 144),
+    "version": (1, 1, 145),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Nymphs",
     "description": "Blender client for NymphsCore image, shape, and texture backends",
@@ -7524,7 +7524,7 @@ class NYMPHSV2_PT_server(bpy.types.Panel):
         if progress_value:
             top.label(text=f"Progress: {progress_value}"[:160])
 
-        startup = layout.box()
+        startup = layout.column(align=True)
         startup.prop(
             state,
             "show_startup",
@@ -7539,7 +7539,7 @@ class NYMPHSV2_PT_server(bpy.types.Panel):
             for service_key in SERVICE_ORDER:
                 _draw_service_block(startup, state, service_key)
 
-        advanced = layout.box()
+        advanced = layout.column(align=True)
         advanced.prop(
             state,
             "show_advanced",
@@ -7548,7 +7548,7 @@ class NYMPHSV2_PT_server(bpy.types.Panel):
             emboss=False,
         )
         if state.show_advanced:
-            target = advanced.box()
+            target = advanced.column(align=True)
             target.label(text="WSL Target")
             target.use_property_split = True
             target.use_property_decorate = False
@@ -7559,12 +7559,14 @@ class NYMPHSV2_PT_server(bpy.types.Panel):
             guidance_entries = _runtime_guidance_entries(state)
             if guidance_entries:
                 for _service_key, label, api_root, estimate, basis, mode, caveat in guidance_entries:
-                    estimate_box = advanced.box()
+                    estimate_box = advanced.column(align=True)
+                    estimate_box.separator()
                     estimate_box.label(text=f"{label}: {estimate} | {mode}"[:160])
                     estimate_box.label(text=f"API: {api_root}"[:160])
                     _draw_wrapped_lines(estimate_box, basis, width=48, max_lines=1)
                     _draw_wrapped_lines(estimate_box, caveat, prefix="Note: ", width=48, max_lines=2)
-            gpu_box = advanced.box()
+            gpu_box = advanced.column(align=True)
+            gpu_box.separator()
             gpu_box.label(text="GPU")
             gpu_box.operator("nymphsv2.probe_gpu", text="Refresh GPU")
             gpu_box.label(text=f"GPU: {state.gpu_name}"[:160])
@@ -7649,12 +7651,7 @@ class NYMPHSV2_PT_image_generation(bpy.types.Panel):
                     gemini_model_row.prop(state, "gemini_model", text="")
                     gemini_box.prop(state, "openrouter_api_key", text="API")
                     if not (state.openrouter_api_key or os.environ.get("OPENROUTER_API_KEY")):
-                        _draw_wrapped_lines(
-                            gemini_box,
-                            "Uses OPENROUTER_API_KEY when the field is blank.",
-                            width=48,
-                            max_lines=2,
-                        )
+                        gemini_box.label(text="Use an OpenRouter API key.")
                     gemini_row = gemini_box.row(align=True)
                     gemini_row.prop(state, "gemini_aspect_ratio")
                     if _gemini_model_id(state) in GEMINI_IMAGE_SIZE_MODELS:
@@ -8106,41 +8103,44 @@ class NYMPHSV2_PT_shape(bpy.types.Panel):
             seed_row.prop(state, "trellis_seed", text="Seed")
             trellis_opts.prop(state, "trellis_max_tokens", text="Tokens")
 
-            sparse_box = trellis_opts.box()
-            sparse_box.label(text="Early Pass")
-            row = sparse_box.row(align=True)
+            early_pass = trellis_opts.column(align=True)
+            early_pass.separator()
+            early_pass.label(text="Early Pass")
+            row = early_pass.row(align=True)
             row.prop(state, "trellis_ss_sampling_steps", text="Steps")
             row.prop(state, "trellis_ss_guidance_strength", text="Image")
-            sparse_box.prop(state, "trellis_ss_guidance_rescale", text="Rescale")
-            interval_row = sparse_box.row(align=True)
+            early_pass.prop(state, "trellis_ss_guidance_rescale", text="Rescale")
+            interval_row = early_pass.row(align=True)
             interval_row.prop(state, "trellis_ss_guidance_interval_start", text="Start")
             interval_row.prop(state, "trellis_ss_guidance_interval_end", text="End")
-            sparse_box.prop(state, "trellis_ss_rescale_t", text="Timing")
+            early_pass.prop(state, "trellis_ss_rescale_t", text="Timing")
 
-            shape_box = trellis_opts.box()
-            shape_box.label(text="Shape Pass")
-            row = shape_box.row(align=True)
+            shape_pass = trellis_opts.column(align=True)
+            shape_pass.separator()
+            shape_pass.label(text="Shape Pass")
+            row = shape_pass.row(align=True)
             row.prop(state, "trellis_shape_sampling_steps", text="Steps")
             row.prop(state, "trellis_shape_guidance_strength", text="Image")
-            shape_box.prop(state, "trellis_shape_guidance_rescale", text="Rescale")
-            interval_row = shape_box.row(align=True)
+            shape_pass.prop(state, "trellis_shape_guidance_rescale", text="Rescale")
+            interval_row = shape_pass.row(align=True)
             interval_row.prop(state, "trellis_shape_guidance_interval_start", text="Start")
             interval_row.prop(state, "trellis_shape_guidance_interval_end", text="End")
-            shape_box.prop(state, "trellis_shape_rescale_t", text="Timing")
+            shape_pass.prop(state, "trellis_shape_rescale_t", text="Timing")
 
             if state.shape_generate_texture:
-                texture_box = trellis_opts.box()
-                texture_box.label(text="Texture Pass")
-                row = texture_box.row(align=True)
+                texture_pass = trellis_opts.column(align=True)
+                texture_pass.separator()
+                texture_pass.label(text="Texture Pass")
+                row = texture_pass.row(align=True)
                 row.prop(state, "trellis_tex_sampling_steps", text="Steps")
                 row.prop(state, "trellis_tex_guidance_strength", text="Image")
-                texture_box.prop(state, "trellis_tex_guidance_rescale", text="Rescale")
-                interval_row = texture_box.row(align=True)
+                texture_pass.prop(state, "trellis_tex_guidance_rescale", text="Rescale")
+                interval_row = texture_pass.row(align=True)
                 interval_row.prop(state, "trellis_tex_guidance_interval_start", text="Start")
                 interval_row.prop(state, "trellis_tex_guidance_interval_end", text="End")
-                texture_box.prop(state, "trellis_tex_rescale_t", text="Timing")
-                texture_box.prop(state, "trellis_texture_size")
-                texture_box.prop(state, "trellis_decimation_target", text="Faces")
+                texture_pass.prop(state, "trellis_tex_rescale_t", text="Timing")
+                texture_pass.prop(state, "trellis_texture_size")
+                texture_pass.prop(state, "trellis_decimation_target", text="Faces")
 
             action = panel.row()
             action.enabled = not state.is_busy and not state.imagegen_is_busy
